@@ -1,0 +1,6 @@
+# Local development and testing only (not packaged into Lambda).
+pytest==8.4.2
+ruff==0.13.2
+pandas==2.3.2
+boto3==1.40.39
+moto[s3,dynamodb]==5.1.13
