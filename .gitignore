@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# AWS SAM build output
+.aws-sam/
+
+# Secrets / local config (never commit these)
+.env
+.env.*
+!.env.example
+*.pem
+credentials
+samconfig.local.toml
+
+# Generated sample data (re-create with scripts/generate_sample_data.py)
+data/
+
+# Frontend
+node_modules/
+dashboard/dist/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
