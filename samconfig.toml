@@ -1,0 +1,20 @@
+# SAM CLI defaults so `sam build` / `sam deploy` need no flags.
+# No account IDs or credentials here: those come from your AWS CLI profile.
+version = 0.1
+
+[default.global.parameters]
+stack_name = "gradeflow"
+region = "ap-south-1"
+
+[default.build.parameters]
+cached = true
+parallel = true
+
+[default.validate.parameters]
+lint = true
+
+[default.deploy.parameters]
+capabilities = "CAPABILITY_IAM"  # SAM creates IAM roles for the Lambdas
+confirm_changeset = true         # always show the change set and ask before applying
+resolve_s3 = true                # SAM manages its own bucket for build artifacts
+s3_prefix = "gradeflow"
