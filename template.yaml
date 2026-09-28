@@ -1,0 +1,114 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  GradeFlow - serverless data pipeline for education analytics.
+  Phase 1: S3 upload -> validate Lambda -> DynamoDB META item.
+
+Parameters:
+  MinValidRatio:
+    Type: Number
+    Default: 0.8
+    MinValue: 0
+    MaxValue: 1
+    Description: Minimum share of valid rows for a dataset to be COMPLETED (0-1).
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [arm64] # Graviton: ~20% cheaper than x86 for the same work
+    MemorySize: 256
+    Timeout: 60
+    CodeUri: src/ # every zip Lambda shares the gradeflow package
+
+Resources:
+  # --- Storage ---------------------------------------------------------------------
+
+  RawBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      # Account ID + region keep the name globally unique; resolved at deploy time.
+      BucketName: !Sub "${AWS::StackName}-raw-${AWS::AccountId}-${AWS::Region}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteRawFilesAfter30Days
+            Status: Enabled
+            ExpirationInDays: 30
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+
+  PipelineTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST # on-demand: pay per request, nothing when idle
+      AttributeDefinitions:
+        - { AttributeName: PK, AttributeType: S }
+        - { AttributeName: SK, AttributeType: S }
+        - { AttributeName: GSI1PK, AttributeType: S }
+        - { AttributeName: GSI1SK, AttributeType: S }
+      KeySchema:
+        - { AttributeName: PK, KeyType: HASH }
+        - { AttributeName: SK, KeyType: RANGE }
+      GlobalSecondaryIndexes:
+        - IndexName: GSI1 # list datasets by upload time
+          KeySchema:
+            - { AttributeName: GSI1PK, KeyType: HASH }
+            - { AttributeName: GSI1SK, KeyType: RANGE }
+          Projection:
+            ProjectionType: ALL
+
+  # --- Processing ------------------------------------------------------------------
+
+  ValidateFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Validates uploaded datasets and writes a META item.
+      Handler: gradeflow.entrypoints.validate_handler.handler
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref PipelineTable
+          MIN_VALID_RATIO: !Ref MinValidRatio
+      Policies:
+        # Least privilege: read only the raw bucket, write only this table.
+        # The bucket name is built as a string (not !Ref RawBucket) to avoid a circular
+        # dependency: the bucket already depends on this function for its event trigger.
+        - S3ReadPolicy:
+            BucketName: !Sub "${AWS::StackName}-raw-${AWS::AccountId}-${AWS::Region}"
+        - DynamoDBWritePolicy:
+            TableName: !Ref PipelineTable
+      Events:
+        FileUploaded:
+          Type: S3
+          Properties:
+            Bucket: !Ref RawBucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: uploads/
+
+  ValidateFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ValidateFunction}"
+      RetentionInDays: 14 # default is "never expire", which slowly costs money
+
+Outputs:
+  RawBucketName:
+    Description: Upload files to s3://<this bucket>/uploads/<dataset_id>/<filename>
+    Value: !Ref RawBucket
+  PipelineTableName:
+    Description: DynamoDB table with dataset metadata
+    Value: !Ref PipelineTable
+  ValidateFunctionName:
+    Description: Validate Lambda (check its logs in CloudWatch)
+    Value: !Ref ValidateFunction
