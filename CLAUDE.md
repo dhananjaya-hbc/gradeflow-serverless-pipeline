@@ -342,7 +342,7 @@ Each phase ends with a working, tested, tagged version.
 Claude Code: update this section at the end of every phase.
 
 - [x] Phase 0: Project setup
-- [ ] Phase 1: MVP pipeline (`v0.1.0`)
+- [x] Phase 1: MVP pipeline (`v0.1.0`)
 - [ ] Phase 2: Cleaning & statistics (`v0.2.0`)
 - [ ] Phase 3: Reliability (`v0.3.0`)
 - [ ] Phase 4: Orchestration (`v0.4.0`)
@@ -352,7 +352,7 @@ Claude Code: update this section at the end of every phase.
 - [ ] Phase 8: Observability & security (`v0.8.0`)
 - [ ] Phase 9: CI/CD & release (`v1.0.0`)
 
-**Current phase:** Phase 1 (not started, waiting for "next phase")
+**Current phase:** Phase 2 (not started, waiting for "next phase")
 
 **Notes / decisions log:**
 - Project name **GradeFlow**, Python package `gradeflow`, repo folder `gradeflow-serverless-pipeline`.
@@ -362,3 +362,10 @@ Claude Code: update this section at the end of every phase.
 - Git: one file per commit, conventional messages, ask before committing, no co-author trailers.
 - Folders from Section 9 are created only when a phase first puts a file in them (git doesn't track empty folders).
 - Sample generator uses stdlib only; default seed 42 → 904 rows with 3 injected T1→T2 jumps.
+- Phase 1 (deployed + verified 2026-09-28): stack `gradeflow` in `ap-south-1`. Sample CSV → `COMPLETED` 904/894/10; missing-columns CSV → `FAILED`.
+- Phase 1 code: `domain/dataset.py` + `domain/validation.py` (pure, `current_year` passed in); `application/ports.py` (`FileStorage`, `DatasetRepository`) + `validate_dataset.py`; `infrastructure/config.py`, `s3_storage.py`, `dynamodb_repository.py`; `entrypoints/validate_handler.py`.
+- `dataset_id` comes from the S3 key `uploads/<dataset_id>/<filename>`; other key shapes are logged and skipped. The "current year" for validation is the S3 event time's year.
+- Subject casing is NOT a validation error (cleaning normalizes it in Phase 2). `row_errors` capped at 20 to keep the META item small.
+- Raw bucket name `${StackName}-raw-${AccountId}-${Region}` is built with `!Sub`. The Lambda's S3ReadPolicy uses the same string (not `!Ref`) to avoid a bucket↔function circular dependency.
+- Lambdas run on arm64, 256 MB, 60 s; log groups keep 14 days. `MinValidRatio` is a SAM parameter → env var `MIN_VALID_RATIO`.
+- Adapters are built lazily with `@functools.cache` in the handler (one set per warm container); `process_event(event, use_case)` takes the use case as a parameter so tests can inject fakes.
