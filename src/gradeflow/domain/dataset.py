@@ -25,4 +25,7 @@ class DatasetMeta:
     valid_rows: int = 0
     invalid_rows: int = 0
     row_errors: tuple[str, ...] = ()
+    clean_rows: int = 0  # rows left after cleaning (valid rows minus duplicates)
+    duplicates_removed: int = 0
+    processed_key: str | None = None  # where the cleaned Parquet file was written
     error_message: str | None = None
