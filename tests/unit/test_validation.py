@@ -9,6 +9,7 @@ from gradeflow.domain.validation import (
     FileValidationError,
     ValidationReport,
     parse_rows,
+    split_valid_rows,
     validate_row,
     validate_rows,
 )
@@ -142,6 +143,13 @@ def test_validate_rows_counts_and_reports() -> None:
     assert report.valid_ratio == 0.5
     assert report.row_errors[0].startswith("row 2: score '150'")
     assert report.row_errors[1] == "row 4: missing term"
+
+
+def test_split_valid_rows_returns_only_valid_rows() -> None:
+    good_2 = row(student_id="S00002")
+    valid, report = split_valid_rows([GOOD_ROW, row(score="150"), good_2], YEAR)
+    assert valid == [GOOD_ROW, good_2]
+    assert (report.total_rows, report.valid_rows) == (3, 2)
 
 
 def test_reported_errors_are_capped() -> None:
