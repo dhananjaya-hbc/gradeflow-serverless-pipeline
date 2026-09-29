@@ -118,17 +118,23 @@ def validate_row(row: Row, current_year: int) -> list[str]:
     return problems
 
 
-def validate_rows(rows: list[Row], current_year: int) -> ValidationReport:
-    """Validate every row and summarise the results. Row numbers start at 1."""
-    valid_rows = 0
+def split_valid_rows(rows: list[Row], current_year: int) -> tuple[list[Row], ValidationReport]:
+    """Return the valid rows (for cleaning) plus a summary report. Row numbers start at 1."""
+    valid: list[Row] = []
     errors: list[str] = []
     for number, row in enumerate(rows, start=1):
         problems = validate_row(row, current_year)
         if not problems:
-            valid_rows += 1
+            valid.append(row)
         elif len(errors) < MAX_REPORTED_ERRORS:
             errors.append(f"row {number}: {'; '.join(problems)}")
-    return ValidationReport(total_rows=len(rows), valid_rows=valid_rows, row_errors=tuple(errors))
+    report = ValidationReport(total_rows=len(rows), valid_rows=len(valid), row_errors=tuple(errors))
+    return valid, report
+
+
+def validate_rows(rows: list[Row], current_year: int) -> ValidationReport:
+    """Validate every row and return only the summary report."""
+    return split_valid_rows(rows, current_year)[1]
 
 
 def _is_missing(value: object) -> bool:
