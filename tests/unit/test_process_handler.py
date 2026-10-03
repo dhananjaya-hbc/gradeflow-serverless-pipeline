@@ -1,13 +1,16 @@
-"""Unit tests for the validate Lambda handler (event parsing + wiring), no AWS."""
+"""Unit tests for the process Lambda handler (event parsing + wiring), no AWS."""
 
 from datetime import UTC, datetime
 
+import pandas as pd
 import pytest
 
-from gradeflow.application.validate_dataset import ValidateDataset
+from gradeflow.application.process_dataset import ProcessDataset
 from gradeflow.domain.dataset import DatasetMeta
-from gradeflow.entrypoints import validate_handler
-from gradeflow.entrypoints.validate_handler import dataset_id_from_key, parse_record, process_event
+from gradeflow.domain.statistics import DatasetStats
+from gradeflow.entrypoints import process_handler
+from gradeflow.entrypoints.process_handler import dataset_id_from_key, parse_record, process_event
+from gradeflow.infrastructure.s3_parquet_writer import S3ParquetWriter
 
 CSV = (
     b"student_id,student_name,class,subject,term,year,score\n"
@@ -31,12 +34,26 @@ class FakeStorage:
         return self.files[(bucket, key)]
 
 
+class FakeWriter:
+    def __init__(self) -> None:
+        self.written: dict[str, pd.DataFrame] = {}
+
+    def write(self, dataset_id: str, data: pd.DataFrame) -> str:
+        key = f"processed/{dataset_id}/data.parquet"
+        self.written[key] = data
+        return key
+
+
 class FakeRepository:
     def __init__(self) -> None:
-        self.saved: list[DatasetMeta] = []
+        self.metas: list[DatasetMeta] = []
+        self.stats: dict[str, DatasetStats] = {}
 
     def save_meta(self, meta: DatasetMeta) -> None:
-        self.saved.append(meta)
+        self.metas.append(meta)
+
+    def save_stats(self, dataset_id: str, stats: DatasetStats) -> None:
+        self.stats[dataset_id] = stats
 
 
 @pytest.mark.parametrize(
@@ -71,10 +88,14 @@ def test_parse_record_rejects_bad_key() -> None:
     assert parse_record(s3_record("random.csv")) is None
 
 
-def test_process_event_validates_and_skips() -> None:
-    repository = FakeRepository()
-    use_case = ValidateDataset(
-        FakeStorage({("raw", "uploads/ds-1/results.csv"): CSV}), repository, min_valid_ratio=0.8
+def test_process_event_processes_and_skips() -> None:
+    writer, repository = FakeWriter(), FakeRepository()
+    use_case = ProcessDataset(
+        storage=FakeStorage({("raw", "uploads/ds-1/results.csv"): CSV}),
+        writer=writer,
+        repository=repository,
+        min_valid_ratio=0.8,
+        pass_mark=50,
     )
     event = {"Records": [s3_record("uploads/ds-1/results.csv"), s3_record("stray.csv")]}
 
@@ -84,7 +105,9 @@ def test_process_event_validates_and_skips() -> None:
         "processed": [{"dataset_id": "ds-1", "status": "COMPLETED"}],
         "skipped": ["stray.csv"],
     }
-    assert [meta.dataset_id for meta in repository.saved] == ["ds-1"]
+    assert [meta.status for meta in repository.metas] == ["PROCESSING", "COMPLETED"]
+    assert list(writer.written) == ["processed/ds-1/data.parquet"]
+    assert repository.stats["ds-1"].overall.count == 1
 
 
 def test_process_event_without_records() -> None:
@@ -92,14 +115,19 @@ def test_process_event_without_records() -> None:
 
 
 def test_handler_builds_use_case_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """handler() wires real adapters from config; here we only check it reads TABLE_NAME."""
+    """handler() wires real adapters from config (no AWS call happens while building)."""
     monkeypatch.setenv("AWS_DEFAULT_REGION", "ap-south-1")
     monkeypatch.setenv("TABLE_NAME", "PipelineTable")
+    monkeypatch.setenv("PROCESSED_BUCKET", "processed-bucket")
     monkeypatch.setenv("MIN_VALID_RATIO", "0.9")
-    validate_handler._build_use_case.cache_clear()
+    monkeypatch.setenv("PASS_MARK", "40")
+    process_handler._build_use_case.cache_clear()
     try:
-        use_case = validate_handler._build_use_case()
+        use_case = process_handler._build_use_case()
         assert use_case._min_valid_ratio == 0.9
-        assert use_case is validate_handler._build_use_case()  # cached per container
+        assert use_case._pass_mark == 40.0
+        assert isinstance(use_case._writer, S3ParquetWriter)
+        assert use_case._writer._bucket == "processed-bucket"
+        assert use_case is process_handler._build_use_case()  # cached per container
     finally:
-        validate_handler._build_use_case.cache_clear()
+        process_handler._build_use_case.cache_clear()
