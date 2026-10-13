@@ -258,7 +258,7 @@ gradeflow-serverless-pipeline/
     └── ci.yml
 ```
 
-All zip Lambdas share `CodeUri: src/` and differ only by handler (e.g. `gradeflow.entrypoints.validate_handler.handler`).
+All zip Lambdas share `CodeUri: src/` and differ only by handler (e.g. `gradeflow.entrypoints.process_handler.handler`).
 
 ---
 
@@ -343,7 +343,7 @@ Claude Code: update this section at the end of every phase.
 
 - [x] Phase 0: Project setup
 - [x] Phase 1: MVP pipeline (`v0.1.0`)
-- [ ] Phase 2: Cleaning & statistics (`v0.2.0`)
+- [x] Phase 2: Cleaning & statistics (`v0.2.0`)
 - [ ] Phase 3: Reliability (`v0.3.0`)
 - [ ] Phase 4: Orchestration (`v0.4.0`)
 - [ ] Phase 5: Anomaly detection (`v0.5.0`)
@@ -352,7 +352,7 @@ Claude Code: update this section at the end of every phase.
 - [ ] Phase 8: Observability & security (`v0.8.0`)
 - [ ] Phase 9: CI/CD & release (`v1.0.0`)
 
-**Current phase:** Phase 2 (not started, waiting for "next phase")
+**Current phase:** Phase 3 (not started, waiting for "next phase")
 
 **Notes / decisions log:**
 - Project name **GradeFlow**, Python package `gradeflow`, repo folder `gradeflow-serverless-pipeline`.
@@ -369,3 +369,8 @@ Claude Code: update this section at the end of every phase.
 - Raw bucket name `${StackName}-raw-${AccountId}-${Region}` is built with `!Sub`. The Lambda's S3ReadPolicy uses the same string (not `!Ref`) to avoid a bucket↔function circular dependency.
 - Lambdas run on arm64, 256 MB, 60 s; log groups keep 14 days. `MinValidRatio` is a SAM parameter → env var `MIN_VALID_RATIO`.
 - Adapters are built lazily with `@functools.cache` in the handler (one set per warm container); `process_event(event, use_case)` takes the use case as a parameter so tests can inject fakes.
+- Phase 2 (deployed + verified 2026-10-13): sample CSV → `COMPLETED`, 904 total / 894 valid / 891 clean / 3 duplicates; `STATS#OVERALL` mean 62.43, pass rate 78.34, 60 students; 15 `STATS#SUBJECT#` items; Parquet at `processed/<id>/data.parquet`.
+- Phase 2 code: `domain/cleaning.py` (pandas; subject acronyms ICT/IT/PE stay upper case), `domain/statistics.py` (frozen dataclasses, sample std ddof=1, ties ordered by student_id), `split_valid_rows` in validation; `application/process_dataset.py` (`ProcessDataset`, replaces `ValidateDataset`; saves META `PROCESSING` first and `COMPLETED` last); ports `ProcessedDataWriter` + `DatasetRepository.save_stats`; `infrastructure/s3_parquet_writer.py`; `process_handler.py` replaces `validate_handler.py`.
+- Template: `ValidateFunction` renamed `ProcessFunction` (512 MB, 120 s) with the AWS SDK for pandas layer 3.17.1 (parameter `PandasLayerArn`, ap-south-1 arm64 version 31; local pyarrow pinned 25.0.1 to match its `<26` limit). New `ProcessedBucket` (no expiry), params `PassMark`, env vars `PROCESSED_BUCKET`, `PASS_MARK`.
+- DynamoDB floats are stored as `Decimal(str(value))` (exact rounded values). Stats written with `batch_writer`. 0 valid rows is always `FAILED` even if `MinValidRatio=0`.
+- Known gap for Phase 3: re-uploading the same `dataset_id` can leave stale `STATS#` items from the earlier upload; idempotency (file hash) addresses re-uploads.
