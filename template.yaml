@@ -2,7 +2,7 @@ AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
 Description: >
   GradeFlow - serverless data pipeline for education analytics.
-  Phase 1: S3 upload -> validate Lambda -> DynamoDB META item.
+  Phase 2: S3 upload -> process Lambda (validate, clean, stats) -> Parquet in S3 + DynamoDB.
 
 Parameters:
   MinValidRatio:
@@ -11,6 +11,19 @@ Parameters:
     MinValue: 0
     MaxValue: 1
     Description: Minimum share of valid rows for a dataset to be COMPLETED (0-1).
+  PassMark:
+    Type: Number
+    Default: 50
+    MinValue: 0
+    MaxValue: 100
+    Description: Scores at or above this count as a pass (0-100).
+  PandasLayerArn:
+    Type: String
+    # AWS SDK for pandas 3.17.1 (pandas, numpy, pyarrow), published by AWS for
+    # ap-south-1 / Python 3.12 / arm64. List for other regions:
+    # https://aws-sdk-pandas.readthedocs.io/en/stable/layers.html
+    Default: arn:aws:lambda:ap-south-1:336392948345:layer:AWSSDKPandas-Python312-Arm64:31
+    Description: ARN of the AWS SDK for pandas managed Lambda layer.
 
 Globals:
   Function:
@@ -45,6 +58,21 @@ Resources:
             AbortIncompleteMultipartUpload:
               DaysAfterInitiation: 1
 
+  ProcessedBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      # Cleaned Parquet output: processed/<dataset_id>/data.parquet. Kept (no expiry).
+      BucketName: !Sub "${AWS::StackName}-processed-${AWS::AccountId}-${AWS::Region}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
   PipelineTable:
     Type: AWS::DynamoDB::Table
     Properties:
@@ -67,21 +95,30 @@ Resources:
 
   # --- Processing ------------------------------------------------------------------
 
-  ValidateFunction:
+  ProcessFunction:
     Type: AWS::Serverless::Function
     Properties:
-      Description: Validates uploaded datasets and writes a META item.
-      Handler: gradeflow.entrypoints.validate_handler.handler
+      Description: Validates, cleans and summarises uploaded datasets.
+      Handler: gradeflow.entrypoints.process_handler.handler
+      MemorySize: 512 # pandas needs more memory; more memory also means more CPU
+      Timeout: 120
+      Layers:
+        - !Ref PandasLayerArn
       Environment:
         Variables:
           TABLE_NAME: !Ref PipelineTable
+          PROCESSED_BUCKET: !Ref ProcessedBucket
           MIN_VALID_RATIO: !Ref MinValidRatio
+          PASS_MARK: !Ref PassMark
       Policies:
-        # Least privilege: read only the raw bucket, write only this table.
-        # The bucket name is built as a string (not !Ref RawBucket) to avoid a circular
+        # Least privilege: read only the raw bucket, write only the processed bucket
+        # and this table.
+        # The raw bucket name is built as a string (not !Ref RawBucket) to avoid a circular
         # dependency: the bucket already depends on this function for its event trigger.
         - S3ReadPolicy:
             BucketName: !Sub "${AWS::StackName}-raw-${AWS::AccountId}-${AWS::Region}"
+        - S3WritePolicy:
+            BucketName: !Ref ProcessedBucket
         - DynamoDBWritePolicy:
             TableName: !Ref PipelineTable
       Events:
@@ -96,19 +133,22 @@ Resources:
                   - Name: prefix
                     Value: uploads/
 
-  ValidateFunctionLogGroup:
+  ProcessFunctionLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
-      LogGroupName: !Sub "/aws/lambda/${ValidateFunction}"
+      LogGroupName: !Sub "/aws/lambda/${ProcessFunction}"
       RetentionInDays: 14 # default is "never expire", which slowly costs money
 
 Outputs:
   RawBucketName:
     Description: Upload files to s3://<this bucket>/uploads/<dataset_id>/<filename>
     Value: !Ref RawBucket
+  ProcessedBucketName:
+    Description: Cleaned data as Parquet, at processed/<dataset_id>/data.parquet
+    Value: !Ref ProcessedBucket
   PipelineTableName:
-    Description: DynamoDB table with dataset metadata
+    Description: DynamoDB table with dataset metadata and statistics
     Value: !Ref PipelineTable
-  ValidateFunctionName:
-    Description: Validate Lambda (check its logs in CloudWatch)
-    Value: !Ref ValidateFunction
+  ProcessFunctionName:
+    Description: Process Lambda (check its logs in CloudWatch)
+    Value: !Ref ProcessFunction
