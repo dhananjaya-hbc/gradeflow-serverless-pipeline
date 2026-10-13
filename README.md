@@ -16,21 +16,25 @@ Upload ─▶ S3 (raw) ─▶ SQS (+DLQ) ─▶ Trigger Lambda ─▶ Step Funct
                                                      React dashboard ◀── API Gateway + Lambda
 ```
 
-## What works today (v0.1.0)
+## What works today (v0.2.0)
 
 ```
-Upload ─▶ S3 raw bucket ─(ObjectCreated, prefix uploads/)─▶ Validate Lambda ─▶ DynamoDB META item
+Upload ─▶ S3 raw ─(ObjectCreated, prefix uploads/)─▶ Process Lambda ─┬─▶ S3 processed (Parquet)
+                                                  (+ pandas layer)   └─▶ DynamoDB (META + STATS#)
 ```
 
-Upload a CSV or JSON file to `uploads/<dataset_id>/<filename>`. The Validate Lambda:
+Upload a CSV or JSON file to `uploads/<dataset_id>/<filename>`. The Process Lambda:
 
-1. **File-level checks**: readable UTF-8, `.csv` or `.json`, at least one row, all required
-   columns present. Any failure → status `FAILED` with an `error_message`.
-2. **Row-level checks** (see the schema below). Bad rows are counted, and the first 20 are
-   listed in `row_errors`.
-3. **Decision**: status `COMPLETED` if at least `MinValidRatio` (default 80%) of the rows are
-   valid, otherwise `FAILED`.
-4. Writes one item to DynamoDB: `PK=DATASET#<dataset_id>`, `SK=META`.
+1. **Validates.** File-level problems (unreadable UTF-8, wrong extension, no rows, missing
+   columns) → status `FAILED` with an `error_message`. Row-level problems are counted, and the
+   first 20 are listed in `row_errors`. If fewer than `MinValidRatio` (default 80%) of rows are
+   valid, the dataset is `FAILED`.
+2. **Cleans** the valid rows with pandas: trims text, normalises subjects (`maths` → `Maths`,
+   `ict` → `ICT`), casts `year`/`score` to numbers, drops exact duplicates (after normalising).
+3. **Writes Parquet** to `processed/<dataset_id>/data.parquet` in the processed bucket.
+4. **Computes statistics** and saves them to DynamoDB.
+5. Saves the final `META` item. Status flow: `PROCESSING` → `COMPLETED` (or `FAILED`).
+   `COMPLETED` is written last, so a completed dataset always has its Parquet file and stats.
 
 | Column | Rule |
 |---|---|
@@ -40,18 +44,23 @@ Upload a CSV or JSON file to `uploads/<dataset_id>/<filename>`. The Validate Lam
 | `year` | integer, 2000 to the upload year |
 | `score` | number, 0 to 100 |
 
-Example META item for the default sample file (904 rows, 10 deliberately broken):
+### DynamoDB items (table `PipelineTable`)
 
-```json
-{
-  "PK": "DATASET#demo-001", "SK": "META",
-  "status": "COMPLETED", "filename": "student_results.csv",
-  "total_rows": 904, "valid_rows": 894, "invalid_rows": 10,
-  "row_errors": ["row 46: student_id 'S123' must be 'S' + 5 digits", "..."],
-  "uploaded_at": "2026-09-28T18:56:38.685000+00:00",
-  "GSI1PK": "DATASETS", "GSI1SK": "2026-09-28T18:56:38.685000+00:00"
-}
-```
+| PK | SK | Content |
+|---|---|---|
+| `DATASET#<id>` | `META` | status, filename, row counts (`total`/`valid`/`invalid`/`clean`), `duplicates_removed`, `row_errors`, `processed_key`, `error_message` |
+| `DATASET#<id>` | `STATS#OVERALL` | count, mean, median, std, min, max, pass rate, `student_count`, top 5 / bottom 5 students, class averages |
+| `DATASET#<id>` | `STATS#SUBJECT#<subject>#<term>` | the same metrics for one subject and term |
+
+Pass rate is the percentage of scores at or above `PassMark` (default 50). All numbers are
+rounded to 2 decimals. Results for the default sample file (seed 42):
+
+| | |
+|---|---|
+| Rows | 904 uploaded → 894 valid → 891 after removing 3 duplicates |
+| Overall | mean 62.43, median 62, std 16.12, pass rate 78.34% |
+| Students / classes | 60 students; `10-A` 62.11, `10-B` 62.75 |
+| Subject/term items | 15 (5 subjects × 3 terms) |
 
 ## Code architecture
 
@@ -120,31 +129,54 @@ sam build
 sam deploy                    # shows the change set, then asks for confirmation
 ```
 
-Optional: `sam deploy --parameter-overrides MinValidRatio=0.9` changes the valid-row threshold.
+Optional parameters, e.g. `sam deploy --parameter-overrides MinValidRatio=0.9 PassMark=40`.
+
+pandas and pyarrow come from the **AWS SDK for pandas** managed Lambda layer (parameter
+`PandasLayerArn`, default is the `ap-south-1` / Python 3.12 / arm64 layer). In another region,
+pick the ARN from <https://aws-sdk-pandas.readthedocs.io/en/stable/layers.html> and pass it with
+`--parameter-overrides`.
 
 ### Try it
 
 ```bash
-BUCKET=$(aws cloudformation describe-stacks --stack-name gradeflow --region ap-south-1 \
-  --query "Stacks[0].Outputs[?OutputKey=='RawBucketName'].OutputValue" --output text)
-TABLE=$(aws cloudformation describe-stacks --stack-name gradeflow --region ap-south-1 \
-  --query "Stacks[0].Outputs[?OutputKey=='PipelineTableName'].OutputValue" --output text)
+export AWS_PAGER=""
+out() { aws cloudformation describe-stacks --stack-name gradeflow --region ap-south-1 \
+  --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text; }
+BUCKET=$(out RawBucketName); PROCESSED=$(out ProcessedBucketName); TABLE=$(out PipelineTableName)
 
 python scripts/generate_sample_data.py
 aws s3 cp data/student_results.csv s3://$BUCKET/uploads/demo-001/student_results.csv
-
-aws dynamodb get-item --table-name $TABLE --region ap-south-1 \
-  --key '{"PK":{"S":"DATASET#demo-001"},"SK":{"S":"META"}}'
-
-sam logs -n ValidateFunction --stack-name gradeflow --region ap-south-1 --tail   # Lambda logs
+sleep 20   # the first run is a cold start that has to load pandas
 ```
+
+```bash
+# META: expect COMPLETED, clean 891, dups 3
+aws dynamodb get-item --table-name $TABLE --region ap-south-1 \
+  --key '{"PK":{"S":"DATASET#demo-001"},"SK":{"S":"META"}}' \
+  --query "Item.{status:status.S,total:total_rows.N,valid:valid_rows.N,clean:clean_rows.N,dups:duplicates_removed.N,key:processed_key.S}"
+
+# Parquet file
+aws s3 ls s3://$PROCESSED/processed/demo-001/
+
+# Overall stats: expect mean 62.43, pass_rate 78.34, students 60
+aws dynamodb get-item --table-name $TABLE --region ap-south-1 \
+  --key '{"PK":{"S":"DATASET#demo-001"},"SK":{"S":"STATS#OVERALL"}}' \
+  --query "Item.{count:count.N,mean:mean.N,median:median.N,pass_rate:pass_rate.N,students:student_count.N}"
+
+# Lambda logs
+sam logs -n ProcessFunction --stack-name gradeflow --region ap-south-1 --tail
+```
+
+Reading the Parquet back in Python: `pd.read_parquet("s3://<processed bucket>/processed/demo-001/data.parquet")`
+(needs `s3fs`), or download it with `aws s3 cp` and open it locally.
 
 ### Clean up
 
-The bucket must be empty before CloudFormation can delete it:
+Both buckets must be empty before CloudFormation can delete them:
 
 ```bash
 aws s3 rm s3://$BUCKET --recursive
+aws s3 rm s3://$PROCESSED --recursive
 sam delete --stack-name gradeflow --region ap-south-1
 ```
 
@@ -152,22 +184,22 @@ sam delete --stack-name gradeflow --region ap-south-1
 
 At portfolio-demo volume this stays within the AWS Free Tier:
 
-- Lambda runs on arm64 with 256 MB.
+- Lambda runs on arm64 with 512 MB (pandas needs more memory).
 - DynamoDB is on-demand, so it costs nothing when idle.
 - Raw files expire after 30 days.
 - Logs are kept for 14 days.
 
 ### Limits
 
-Lambda reads the whole file into memory and has a 15-minute ceiling (this function uses a
-60 s timeout). The target is files up to about 50 MB. Much larger files would need chunked
+Lambda reads the whole file into memory, builds the Parquet file in memory too, and has a
+15-minute ceiling (this function uses 512 MB and a 120 s timeout). The target is files up to about 50 MB. Much larger files would need chunked
 processing, AWS Glue or Fargate, which are out of scope for this project.
 
 ## Roadmap
 
 - [x] Phase 0: Project setup
 - [x] Phase 1: MVP pipeline (`v0.1.0`)
-- [ ] Phase 2: Cleaning & statistics (`v0.2.0`)
+- [x] Phase 2: Cleaning & statistics (`v0.2.0`)
 - [ ] Phase 3: Reliability: SQS, DLQ, idempotency, quarantine (`v0.3.0`)
 - [ ] Phase 4: Orchestration with Step Functions (`v0.4.0`)
 - [ ] Phase 5: Anomaly detection, rule-based + Isolation Forest (`v0.5.0`)
