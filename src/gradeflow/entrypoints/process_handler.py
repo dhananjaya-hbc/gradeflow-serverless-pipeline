@@ -1,9 +1,14 @@
-"""Lambda handler: S3 upload event -> validate, clean, compute stats -> S3 + DynamoDB.
+"""Lambda handler: SQS message (wrapping an S3 upload event) -> process the dataset.
 
 Handler path in template.yaml: gradeflow.entrypoints.process_handler.handler
+
+Errors are deliberately not caught here: if processing raises, the Lambda call fails, SQS
+shows the message again, and after the queue's maxReceiveCount it lands in the DLQ.
 """
 
+import json
 import logging
+from collections.abc import Iterator
 from datetime import datetime
 from functools import cache
 from typing import Any
@@ -13,6 +18,7 @@ from gradeflow.application.process_dataset import ProcessDataset, ProcessDataset
 from gradeflow.infrastructure.config import load_config
 from gradeflow.infrastructure.dynamodb_repository import DynamoDbDatasetRepository
 from gradeflow.infrastructure.s3_parquet_writer import S3ParquetWriter
+from gradeflow.infrastructure.s3_quarantine import S3Quarantine
 from gradeflow.infrastructure.s3_storage import S3FileStorage
 
 logger = logging.getLogger(__name__)
@@ -31,6 +37,7 @@ def _build_use_case() -> ProcessDataset:
     return ProcessDataset(
         storage=S3FileStorage(),
         writer=S3ParquetWriter(config.processed_bucket),
+        quarantine=S3Quarantine(config.quarantine_bucket),
         repository=DynamoDbDatasetRepository(config.table_name),
         min_valid_ratio=config.min_valid_ratio,
         pass_mark=config.pass_mark,
@@ -38,24 +45,36 @@ def _build_use_case() -> ProcessDataset:
 
 
 def process_event(event: dict[str, Any], use_case: ProcessDataset) -> dict[str, Any]:
-    """Process every uploaded file in an S3 event. Returns a short summary."""
+    """Process every uploaded file in an SQS event. Returns a short summary."""
     processed, skipped = [], []
-    for record in event.get("Records", []):
+    for record in s3_records(event):
         request = parse_record(record)
         if request is None:
             skipped.append(record["s3"]["object"]["key"])
             continue
         meta = use_case.execute(request)
         logger.info(
-            "processed dataset %s: status=%s valid=%d/%d clean=%d",
+            "processed dataset %s: status=%s valid=%d/%d clean=%d duplicate_of=%s",
             meta.dataset_id,
             meta.status,
             meta.valid_rows,
             meta.total_rows,
             meta.clean_rows,
+            meta.duplicate_of,
         )
         processed.append({"dataset_id": meta.dataset_id, "status": meta.status.value})
     return {"processed": processed, "skipped": skipped}
+
+
+def s3_records(event: dict[str, Any]) -> Iterator[dict[str, Any]]:
+    """Yield the S3 records inside each SQS message body.
+
+    S3 also sends a one-off "s3:TestEvent" message when the queue notification is created;
+    it has no "Records" and is skipped. A body that is not valid JSON raises, so the message
+    is retried and finally parked in the DLQ.
+    """
+    for message in event.get("Records", []):
+        yield from json.loads(message["body"]).get("Records", [])
 
 
 def parse_record(record: dict[str, Any]) -> ProcessDatasetRequest | None:
