@@ -1,0 +1,126 @@
+{
+  "Comment": "GradeFlow: validate -> clean -> stats -> store, with a failure branch that records FAILED and sends an alert. Each Lambda gets the whole state and its result is merged into it under validation / cleaning / stats.",
+  "StartAt": "Validate",
+  "States": {
+    "Validate": {
+      "Type": "Task",
+      "Comment": "A bad file is a normal result (validation.valid = false), not an error.",
+      "Resource": "${ValidateFunctionArn}",
+      "ResultPath": "$.validation",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException", "States.TaskFailed"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed" }
+      ],
+      "Next": "IsValid"
+    },
+    "IsValid": {
+      "Type": "Choice",
+      "Choices": [
+        { "Variable": "$.validation.valid", "BooleanEquals": true, "Next": "Clean" }
+      ],
+      "Default": "MarkFailed"
+    },
+    "Clean": {
+      "Type": "Task",
+      "Resource": "${CleanFunctionArn}",
+      "ResultPath": "$.cleaning",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException", "States.TaskFailed"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed" }
+      ],
+      "Next": "Stats"
+    },
+    "Stats": {
+      "Type": "Task",
+      "Resource": "${StatsFunctionArn}",
+      "ResultPath": "$.stats",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException", "States.TaskFailed"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed" }
+      ],
+      "Next": "Store"
+    },
+    "Store": {
+      "Type": "Task",
+      "Resource": "${StoreFunctionArn}",
+      "ResultPath": "$.result",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException", "States.TaskFailed"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed" }
+      ],
+      "End": true
+    },
+    "MarkFailed": {
+      "Type": "Task",
+      "Comment": "Reached for a bad file (quarantined) or after a crash ($.error is set, no quarantine).",
+      "Resource": "${FailFunctionArn}",
+      "ResultPath": "$.failure",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException", "States.TaskFailed"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        { "ErrorEquals": ["States.ALL"], "ResultPath": "$.failure_error", "Next": "FailureNotRecorded" }
+      ],
+      "Next": "NotifyFailure"
+    },
+    "FailureNotRecorded": {
+      "Type": "Pass",
+      "Comment": "Recording the failure failed too. Still alert, with a message NotifyFailure can rely on.",
+      "Result": { "error_message": "the failure could not be recorded in DynamoDB; see this execution" },
+      "ResultPath": "$.failure",
+      "Next": "NotifyFailure"
+    },
+    "NotifyFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${AlertTopicArn}",
+        "Subject": "GradeFlow: dataset failed",
+        "Message.$": "States.Format('Dataset {} ({}) failed: {}', $.dataset_id, $.key, $.failure.error_message)"
+      },
+      "ResultPath": null,
+      "Catch": [
+        { "ErrorEquals": ["States.ALL"], "ResultPath": null, "Next": "PipelineFailed" }
+      ],
+      "Next": "PipelineFailed"
+    },
+    "PipelineFailed": {
+      "Type": "Fail",
+      "Error": "DatasetFailed",
+      "Cause": "The dataset was marked FAILED. See the MarkFailed step output for the reason."
+    }
+  }
+}
