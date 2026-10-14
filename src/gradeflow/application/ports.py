@@ -19,6 +19,14 @@ class FileStorage(Protocol):
         ...
 
 
+class FileQuarantine(Protocol):
+    """Keeps a copy of files that were rejected, for later inspection."""
+
+    def quarantine(self, bucket: str, key: str, dataset_id: str) -> str:
+        """Copy the rejected file out of the raw bucket and return its quarantine key."""
+        ...
+
+
 class ProcessedDataWriter(Protocol):
     """Stores cleaned data for later analysis."""
 
@@ -36,4 +44,16 @@ class DatasetRepository(Protocol):
 
     def save_stats(self, dataset_id: str, stats: DatasetStats) -> None:
         """Create or overwrite the statistics records for a dataset."""
+        ...
+
+    def delete_stats(self, dataset_id: str) -> None:
+        """Remove all statistics records of a dataset (before re-processing it)."""
+        ...
+
+    def claim_file_hash(self, sha256: str, dataset_id: str) -> str | None:
+        """Atomically record that `dataset_id` owns this file content.
+
+        Returns None if the claim succeeded, or the owning dataset_id if the content was
+        claimed before. The owner can be `dataset_id` itself (a retry of the same upload).
+        """
         ...
