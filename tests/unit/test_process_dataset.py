@@ -7,6 +7,7 @@ import pytest
 
 from gradeflow.application.process_dataset import ProcessDataset, ProcessDatasetRequest
 from gradeflow.domain.dataset import DatasetMeta, DatasetStatus
+from gradeflow.domain.fingerprint import sha256_hex
 from gradeflow.domain.statistics import DatasetStats
 
 HEADER = "student_id,student_name,class,subject,term,year,score\n"
@@ -38,12 +39,24 @@ class FakeWriter:
         return key
 
 
+class FakeQuarantine:
+    """Stands in for the quarantine bucket: remembers which files were copied."""
+
+    def __init__(self) -> None:
+        self.copied: list[tuple[str, str, str]] = []  # (bucket, key, dataset_id)
+
+    def quarantine(self, bucket: str, key: str, dataset_id: str) -> str:
+        self.copied.append((bucket, key, dataset_id))
+        return f"quarantine/{dataset_id}/{key.rsplit('/', 1)[-1]}"
+
+
 class FakeRepository:
-    """Stands in for DynamoDB: records every save, in order."""
+    """Stands in for DynamoDB: records every call, in order."""
 
     def __init__(self) -> None:
         self.metas: list[DatasetMeta] = []
         self.stats: dict[str, DatasetStats] = {}
+        self.claims: dict[str, str] = {}  # sha256 -> owning dataset_id
         self.calls: list[str] = []
 
     def save_meta(self, meta: DatasetMeta) -> None:
@@ -54,22 +67,47 @@ class FakeRepository:
         self.stats[dataset_id] = stats
         self.calls.append("stats")
 
+    def delete_stats(self, dataset_id: str) -> None:
+        self.stats.pop(dataset_id, None)
+        self.calls.append("delete_stats")
+
+    def claim_file_hash(self, sha256: str, dataset_id: str) -> str | None:
+        self.calls.append("claim")
+        owner = self.claims.get(sha256)
+        if owner is None:
+            self.claims[sha256] = dataset_id
+        return owner
+
 
 class Harness:
-    """Runs the use case on one file and keeps the fakes for assertions."""
+    """Runs the use case on one upload; pass the fakes of an earlier run to share state."""
 
-    def __init__(self, content: str, key: str = "uploads/ds-1/results.csv") -> None:
-        self.writer = FakeWriter()
-        self.repository = FakeRepository()
+    def __init__(
+        self,
+        content: str,
+        key: str | None = None,
+        dataset_id: str = "ds-1",
+        after: "Harness | None" = None,
+        min_valid_ratio: float = 0.8,
+    ) -> None:
+        key = key or f"uploads/{dataset_id}/results.csv"
+        self.content = content.encode()
+        self.writer = after.writer if after else FakeWriter()
+        self.quarantine = after.quarantine if after else FakeQuarantine()
+        self.repository = after.repository if after else FakeRepository()
+        self.repository.calls.clear()  # each run's call order is asserted on its own
         use_case = ProcessDataset(
-            storage=FakeStorage({("raw", key): content.encode()}),
+            storage=FakeStorage({("raw", key): self.content}),
             writer=self.writer,
+            quarantine=self.quarantine,
             repository=self.repository,
-            min_valid_ratio=0.8,
+            min_valid_ratio=min_valid_ratio,
             pass_mark=50,
         )
         self.result = use_case.execute(
-            ProcessDatasetRequest(dataset_id="ds-1", bucket="raw", key=key, uploaded_at=UPLOADED_AT)
+            ProcessDatasetRequest(
+                dataset_id=dataset_id, bucket="raw", key=key, uploaded_at=UPLOADED_AT
+            )
         )
 
 
@@ -91,13 +129,22 @@ def test_valid_file_is_completed() -> None:
         clean_rows=2,  # 9 valid rows, only 2 distinct once cleaned
         duplicates_removed=7,
         processed_key="processed/ds-1/data.parquet",
+        file_hash=sha256_hex(run.content),
+        duplicate_of=None,
+        quarantine_key=None,
         error_message=None,
     )
 
 
 def test_saves_happen_in_order_with_completed_last() -> None:
     run = Harness(HEADER + GOOD + GOOD_2)
-    assert run.repository.calls == ["meta:PROCESSING", "stats", "meta:COMPLETED"]
+    assert run.repository.calls == [
+        "meta:PROCESSING",
+        "claim",
+        "delete_stats",
+        "stats",
+        "meta:COMPLETED",
+    ]
     assert run.repository.metas[-1] == run.result
 
 
@@ -129,43 +176,86 @@ def test_stats_are_computed_with_the_pass_mark() -> None:
 def test_ratio_exactly_at_threshold_passes() -> None:
     run = Harness(HEADER + GOOD * 8 + BAD * 2)
     assert run.result.status == DatasetStatus.COMPLETED
+    assert run.quarantine.copied == []
 
 
-# --- failure paths -------------------------------------------------------------------
+# --- idempotency ---------------------------------------------------------------------
 
 
-def assert_failed_without_outputs(run: Harness) -> None:
+def test_identical_file_under_another_id_is_a_duplicate() -> None:
+    first = Harness(HEADER + GOOD + GOOD_2, dataset_id="ds-1")
+    second = Harness(HEADER + GOOD + GOOD_2, dataset_id="ds-2", after=first)
+
+    assert second.result.status == DatasetStatus.DUPLICATE
+    assert second.result.duplicate_of == "ds-1"
+    assert second.result.file_hash == first.result.file_hash
+    assert "ds-1" in second.result.error_message
+
+
+def test_duplicate_does_nothing_but_record_itself() -> None:
+    first = Harness(HEADER + GOOD + GOOD_2, dataset_id="ds-1")
+    second = Harness(HEADER + GOOD + GOOD_2, dataset_id="ds-2", after=first)
+
+    assert second.repository.calls == ["meta:PROCESSING", "claim", "meta:DUPLICATE"]
+    assert list(second.writer.written) == ["processed/ds-1/data.parquet"]  # nothing for ds-2
+    assert list(second.repository.stats) == ["ds-1"]
+    assert second.quarantine.copied == []
+    assert first.result.status == DatasetStatus.COMPLETED  # the original is untouched
+
+
+def test_retry_of_the_same_upload_is_processed_again() -> None:
+    """SQS delivers at least once: a redelivered message must not be treated as a duplicate."""
+    first = Harness(HEADER + GOOD + GOOD_2, dataset_id="ds-1")
+    retry = Harness(HEADER + GOOD + GOOD_2, dataset_id="ds-1", after=first)
+
+    assert retry.result.status == DatasetStatus.COMPLETED
+    assert retry.result.duplicate_of is None
+    assert retry.repository.calls[-1] == "meta:COMPLETED"
+
+
+def test_different_content_is_not_a_duplicate() -> None:
+    first = Harness(HEADER + GOOD, dataset_id="ds-1")
+    second = Harness(HEADER + GOOD + GOOD_2, dataset_id="ds-2", after=first)
+
+    assert second.result.status == DatasetStatus.COMPLETED
+    assert set(second.repository.stats) == {"ds-1", "ds-2"}
+
+
+def test_reprocessing_an_id_replaces_its_old_stats() -> None:
+    first = Harness(HEADER + GOOD, dataset_id="ds-1")
+    old_stats = first.repository.stats["ds-1"]
+    second = Harness(HEADER + GOOD + GOOD_2, dataset_id="ds-1", after=first)
+
+    assert second.repository.calls.index("delete_stats") < second.repository.calls.index("stats")
+    assert second.repository.stats["ds-1"] is not old_stats
+    assert second.repository.stats["ds-1"].overall.count == 2
+
+
+# --- failure paths and quarantine ----------------------------------------------------
+
+
+def assert_failed_and_quarantined(run: Harness, key: str) -> None:
     assert run.result.status == DatasetStatus.FAILED
-    assert run.repository.calls == ["meta:PROCESSING", "meta:FAILED"]
+    assert run.repository.calls == ["meta:PROCESSING", "claim", "meta:FAILED"]
+    assert run.quarantine.copied == [("raw", key, "ds-1")]
+    assert run.result.quarantine_key == f"quarantine/ds-1/{key.rsplit('/', 1)[-1]}"
+    assert run.result.file_hash == sha256_hex(run.content)
     assert run.writer.written == {}
     assert run.repository.stats == {}
     assert run.result.processed_key is None
 
 
-def test_too_many_invalid_rows_fails() -> None:
+def test_too_many_invalid_rows_fails_and_is_quarantined() -> None:
     run = Harness(HEADER + GOOD * 7 + BAD * 3)
 
-    assert_failed_without_outputs(run)
+    assert_failed_and_quarantined(run, "uploads/ds-1/results.csv")
     assert run.result.error_message == "only 70.0% of rows are valid (minimum 80.0%)"
     assert (run.result.valid_rows, run.result.invalid_rows) == (7, 3)
 
 
 def test_no_valid_rows_fails_even_with_zero_threshold() -> None:
-    writer, repository = FakeWriter(), FakeRepository()
-    use_case = ProcessDataset(
-        FakeStorage({("raw", "uploads/ds-1/a.csv"): (HEADER + BAD).encode()}),
-        writer,
-        repository,
-        min_valid_ratio=0.0,
-        pass_mark=50,
-    )
-    result = use_case.execute(
-        ProcessDatasetRequest("ds-1", "raw", "uploads/ds-1/a.csv", UPLOADED_AT)
-    )
-
-    assert result.status == DatasetStatus.FAILED
-    assert writer.written == {}
-    assert repository.stats == {}
+    run = Harness(HEADER + BAD, min_valid_ratio=0.0)
+    assert_failed_and_quarantined(run, "uploads/ds-1/results.csv")
 
 
 @pytest.mark.parametrize(
@@ -177,12 +267,23 @@ def test_no_valid_rows_fails_even_with_zero_threshold() -> None:
         ("a,b", "uploads/ds-1/results.txt", "unsupported file type"),
     ],
 )
-def test_file_level_error_fails_with_message(content: str, key: str, message: str) -> None:
+def test_file_level_error_fails_and_is_quarantined(content: str, key: str, message: str) -> None:
     run = Harness(content, key)
 
-    assert_failed_without_outputs(run)
+    assert_failed_and_quarantined(run, key)
     assert message in run.result.error_message
     assert run.result.total_rows == 0
+
+
+def test_a_failed_file_still_claims_its_hash() -> None:
+    """Re-uploading the same broken file under a new ID is reported as a duplicate."""
+    first = Harness(HEADER, dataset_id="ds-1")
+    second = Harness(HEADER, dataset_id="ds-2", after=first)
+
+    assert first.result.status == DatasetStatus.FAILED
+    assert second.result.status == DatasetStatus.DUPLICATE
+    assert second.result.duplicate_of == "ds-1"
+    assert len(second.quarantine.copied) == 1  # only the first upload was quarantined
 
 
 # --- request -------------------------------------------------------------------------
