@@ -1,5 +1,6 @@
 """Unit tests for the workflow step use cases, using in-memory fakes."""
 
+import json
 import re
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -365,6 +366,34 @@ def test_crash_after_validation_keeps_the_row_counts() -> None:
 
     assert quarantine.copied == []
     assert (repository.current["ds-1"].total_rows, repository.current["ds-1"].valid_rows) == (10, 9)
+
+
+def test_lambda_error_cause_is_reduced_to_its_message_without_the_stack_trace() -> None:
+    cause = json.dumps(
+        {
+            "errorMessage": "An error occurred (NoSuchKey) when calling the GetObject operation",
+            "errorType": "NoSuchKey",
+            "requestId": "6582dc3e",
+            "stackTrace": ['  File "/var/task/gradeflow/entrypoints/validate_handler.py", line 22'],
+        }
+    )
+    state = make_state(error={"Error": "NoSuchKey", "Cause": cause})
+
+    _, repository = reject(state)
+
+    assert repository.current["ds-1"].error_message == (
+        "processing failed (NoSuchKey: An error occurred (NoSuchKey) when calling the "
+        "GetObject operation)"
+    )
+
+
+def test_json_cause_without_an_error_message_is_kept_as_is() -> None:
+    state = make_state(error={"Error": "States.Timeout", "Cause": '{"code": 7}'})
+    _, repository = reject(state)
+    assert (
+        repository.current["ds-1"].error_message
+        == 'processing failed (States.Timeout: {"code": 7})'
+    )
 
 
 def test_long_crash_messages_are_truncated() -> None:
