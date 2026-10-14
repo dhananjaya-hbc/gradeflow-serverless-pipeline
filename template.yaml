@@ -2,7 +2,8 @@ AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
 Description: >
   GradeFlow - serverless data pipeline for education analytics.
-  Phase 2: S3 upload -> process Lambda (validate, clean, stats) -> Parquet in S3 + DynamoDB.
+  Phase 3: S3 upload -> SQS (+DLQ) -> process Lambda (validate, clean, stats; skips duplicate
+  files, quarantines broken ones) -> Parquet in S3 + DynamoDB.
 
 Parameters:
   MinValidRatio:
@@ -38,6 +39,9 @@ Resources:
 
   RawBucket:
     Type: AWS::S3::Bucket
+    # S3 validates the queue's permissions when it creates the notification, so the queue
+    # policy must exist first.
+    DependsOn: UploadQueuePolicy
     Properties:
       # Account ID + region keep the name globally unique; resolved at deploy time.
       BucketName: !Sub "${AWS::StackName}-raw-${AWS::AccountId}-${AWS::Region}"
@@ -57,6 +61,15 @@ Resources:
             ExpirationInDays: 30
             AbortIncompleteMultipartUpload:
               DaysAfterInitiation: 1
+      NotificationConfiguration:
+        QueueConfigurations:
+          - Event: s3:ObjectCreated:*
+            Queue: !GetAtt UploadQueue.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: uploads/
 
   ProcessedBucket:
     Type: AWS::S3::Bucket
@@ -72,6 +85,26 @@ Resources:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
               SSEAlgorithm: AES256
+
+  QuarantineBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      # Copies of rejected files: quarantine/<dataset_id>/<filename>. For inspection only.
+      BucketName: !Sub "${AWS::StackName}-quarantine-${AWS::AccountId}-${AWS::Region}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteQuarantinedFilesAfter30Days
+            Status: Enabled
+            ExpirationInDays: 30
 
   PipelineTable:
     Type: AWS::DynamoDB::Table
@@ -93,12 +126,53 @@ Resources:
           Projection:
             ProjectionType: ALL
 
+  # --- Queues ----------------------------------------------------------------------
+
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600 # 14 days (the maximum) to investigate failures
+      SqsManagedSseEnabled: true
+
+  UploadQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      # AWS recommends at least 6x the consumer's timeout (120 s) so a slow run is not
+      # delivered to a second Lambda while still processing.
+      VisibilityTimeout: 720
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DeadLetterQueue.Arn
+        maxReceiveCount: 3 # after 3 failed receives the message moves to the DLQ
+
+  UploadQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref UploadQueue
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowRawBucketToSendUploadEvents
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt UploadQueue.Arn
+            Condition:
+              # The bucket ARN is built as a string (not !GetAtt RawBucket.Arn): the bucket
+              # depends on this policy, so referencing it would be a circular dependency.
+              ArnEquals:
+                aws:SourceArn: !Sub "arn:${AWS::Partition}:s3:::${AWS::StackName}-raw-${AWS::AccountId}-${AWS::Region}"
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
   # --- Processing ------------------------------------------------------------------
 
   ProcessFunction:
     Type: AWS::Serverless::Function
     Properties:
-      Description: Validates, cleans and summarises uploaded datasets.
+      Description: Validates, cleans and summarises uploaded datasets (one SQS message at a time).
       Handler: gradeflow.entrypoints.process_handler.handler
       MemorySize: 512 # pandas needs more memory; more memory also means more CPU
       Timeout: 120
@@ -108,30 +182,35 @@ Resources:
         Variables:
           TABLE_NAME: !Ref PipelineTable
           PROCESSED_BUCKET: !Ref ProcessedBucket
+          QUARANTINE_BUCKET: !Ref QuarantineBucket
           MIN_VALID_RATIO: !Ref MinValidRatio
           PASS_MARK: !Ref PassMark
       Policies:
-        # Least privilege: read only the raw bucket, write only the processed bucket
-        # and this table.
-        # The raw bucket name is built as a string (not !Ref RawBucket) to avoid a circular
-        # dependency: the bucket already depends on this function for its event trigger.
+        # Least privilege: read only the raw bucket, write only the processed and quarantine
+        # buckets, and only the DynamoDB actions the code uses, on this table only.
+        # (For the SQS event SAM also attaches the AWS-managed AWSLambdaSQSQueueExecutionRole,
+        # which covers every queue in the account: to be tightened in the Phase 8 IAM review.)
         - S3ReadPolicy:
-            BucketName: !Sub "${AWS::StackName}-raw-${AWS::AccountId}-${AWS::Region}"
+            BucketName: !Ref RawBucket
         - S3WritePolicy:
             BucketName: !Ref ProcessedBucket
-        - DynamoDBWritePolicy:
-            TableName: !Ref PipelineTable
+        - S3WritePolicy:
+            BucketName: !Ref QuarantineBucket
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:PutItem # META, hash claim (conditional put)
+                - dynamodb:GetItem # read the owner of a claimed hash
+                - dynamodb:Query # find STATS# items to delete
+                - dynamodb:DeleteItem # delete old STATS# items
+                - dynamodb:BatchWriteItem # batch_writer for stats puts and deletes
+              Resource: !GetAtt PipelineTable.Arn
       Events:
-        FileUploaded:
-          Type: S3
+        UploadedFile:
+          Type: SQS
           Properties:
-            Bucket: !Ref RawBucket
-            Events: s3:ObjectCreated:*
-            Filter:
-              S3Key:
-                Rules:
-                  - Name: prefix
-                    Value: uploads/
+            Queue: !GetAtt UploadQueue.Arn
+            BatchSize: 1 # one upload per call, so a failure retries exactly that upload
 
   ProcessFunctionLogGroup:
     Type: AWS::Logs::LogGroup
@@ -146,6 +225,15 @@ Outputs:
   ProcessedBucketName:
     Description: Cleaned data as Parquet, at processed/<dataset_id>/data.parquet
     Value: !Ref ProcessedBucket
+  QuarantineBucketName:
+    Description: Copies of rejected files, at quarantine/<dataset_id>/<filename>
+    Value: !Ref QuarantineBucket
+  UploadQueueUrl:
+    Description: Queue that receives S3 upload events
+    Value: !Ref UploadQueue
+  DeadLetterQueueUrl:
+    Description: Messages that failed 3 times end up here
+    Value: !Ref DeadLetterQueue
   PipelineTableName:
     Description: DynamoDB table with dataset metadata and statistics
     Value: !Ref PipelineTable
