@@ -1,5 +1,7 @@
 """Unit tests for statistics. Expected values are worked out by hand in the comments."""
 
+import json
+
 import pandas as pd
 import pytest
 
@@ -7,6 +9,8 @@ from gradeflow.domain.statistics import (
     ScoreSummary,
     StudentAverage,
     compute_stats,
+    stats_from_dict,
+    stats_to_dict,
     summarize_scores,
 )
 
@@ -157,3 +161,61 @@ def test_groups_are_sorted_by_subject_then_term() -> None:
 def test_empty_dataset_raises() -> None:
     with pytest.raises(ValueError, match="empty"):
         compute_stats(make_data([]), PASS_MARK)
+
+
+# --- JSON round trip (stats travel between Step Functions states as JSON) -------------
+
+
+def test_stats_survive_a_json_round_trip(stats) -> None:
+    """to_dict -> JSON text -> from_dict gives back an equal object (floats stay exact)."""
+    restored = stats_from_dict(json.loads(json.dumps(stats_to_dict(stats))))
+    assert restored == stats
+
+
+def test_stats_dict_uses_only_json_types(stats) -> None:
+    data = stats_to_dict(stats)
+    assert isinstance(data["by_subject_term"], list)
+    assert isinstance(data["top_students"], list)
+    assert data["by_subject_term"][0] == {
+        "subject": "Maths",
+        "term": "T1",
+        "summary": {
+            "count": 4, "mean": 57.5, "median": 55.0, "std": 17.08,
+            "min": 40.0, "max": 80.0, "pass_rate": 75.0,
+        },
+    }  # fmt: skip
+    json.dumps(data)  # raises if anything is not JSON-serialisable
+
+
+def test_round_trip_keeps_tied_students_and_class_names() -> None:
+    students = [("S00002", "B", "10-A", 70, 70), ("S00001", "A", "10-B", 70, 70)]
+    original = compute_stats(make_data(students), PASS_MARK, top_n=2)
+    assert stats_from_dict(json.loads(json.dumps(stats_to_dict(original)))) == original
+
+
+def test_stats_payload_fits_the_step_functions_limit() -> None:
+    """Step Functions allows 256 KB per state payload; check the size we rely on.
+
+    300 subject/term groups (100 subjects x 3 terms) is far beyond a realistic school file.
+    """
+    rows = [
+        {
+            "student_id": f"S{i:05d}",
+            "student_name": f"Student {i}",
+            "class": "10-A",
+            "subject": f"Subject {subject:03d}",
+            "term": term,
+            "year": 2025,
+            "score": float((i * 7 + subject) % 100),
+        }
+        for i in range(1, 6)
+        for subject in range(100)
+        for term in ("T1", "T2", "T3")
+    ]
+    size = len(json.dumps(stats_to_dict(compute_stats(pd.DataFrame(rows), PASS_MARK))))
+    assert size < 100_000  # well under 256 KB
+
+
+def test_sample_sized_payload_is_small() -> None:
+    size = len(json.dumps(stats_to_dict(compute_stats(make_data(), PASS_MARK))))
+    assert size < 3_000
