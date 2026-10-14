@@ -176,7 +176,7 @@ JSON input: an array of objects with the same fields.
 
 | PK | SK | Content |
 |---|---|---|
-| `DATASET#<id>` | `META` | filename, uploaded_at, status (`RECEIVED`/`PROCESSING`/`COMPLETED`/`FAILED`), row counts, file hash, error message |
+| `DATASET#<id>` | `META` | filename, uploaded_at, status (`RECEIVED`/`PROCESSING`/`COMPLETED`/`FAILED`/`DUPLICATE`), row counts, file hash, `duplicate_of`, `quarantine_key`, error message |
 | `DATASET#<id>` | `STATS#OVERALL` | overall mean, median, pass rate, etc. |
 | `DATASET#<id>` | `STATS#SUBJECT#<subject>#<term>` | per-subject/term stats |
 | `DATASET#<id>` | `ANOMALY#<n>` | anomaly type, student_id, details, score, method (`zscore` / `isolation_forest`) |
@@ -344,7 +344,7 @@ Claude Code: update this section at the end of every phase.
 - [x] Phase 0: Project setup
 - [x] Phase 1: MVP pipeline (`v0.1.0`)
 - [x] Phase 2: Cleaning & statistics (`v0.2.0`)
-- [ ] Phase 3: Reliability (`v0.3.0`)
+- [x] Phase 3: Reliability (`v0.3.0`)
 - [ ] Phase 4: Orchestration (`v0.4.0`)
 - [ ] Phase 5: Anomaly detection (`v0.5.0`)
 - [ ] Phase 6: Analytics API (`v0.6.0`)
@@ -352,7 +352,7 @@ Claude Code: update this section at the end of every phase.
 - [ ] Phase 8: Observability & security (`v0.8.0`)
 - [ ] Phase 9: CI/CD & release (`v1.0.0`)
 
-**Current phase:** Phase 3 (not started, waiting for "next phase")
+**Current phase:** Phase 4 (not started, waiting for "next phase")
 
 **Notes / decisions log:**
 - Project name **GradeFlow**, Python package `gradeflow`, repo folder `gradeflow-serverless-pipeline`.
@@ -374,3 +374,10 @@ Claude Code: update this section at the end of every phase.
 - Template: `ValidateFunction` renamed `ProcessFunction` (512 MB, 120 s) with the AWS SDK for pandas layer 3.17.1 (parameter `PandasLayerArn`, ap-south-1 arm64 version 31; local pyarrow pinned 25.0.1 to match its `<26` limit). New `ProcessedBucket` (no expiry), params `PassMark`, env vars `PROCESSED_BUCKET`, `PASS_MARK`.
 - DynamoDB floats are stored as `Decimal(str(value))` (exact rounded values). Stats written with `batch_writer`. 0 valid rows is always `FAILED` even if `MinValidRatio=0`.
 - Known gap for Phase 3: re-uploading the same `dataset_id` can leave stale `STATS#` items from the earlier upload; idempotency (file hash) addresses re-uploads.
+- Phase 3 (deployed + verified 2026-10-14): re-upload as demo-003 → `COMPLETED` (claims the hash); same file as demo-004 → `DUPLICATE` of demo-003, no Parquet; broken file demo-005 → `FAILED` + copy at `quarantine/demo-005/broken.csv`; a non-JSON message sent to the queue failed 3 times and landed in the DLQ (~36 min after sending). Datasets from before Phase 3 (e.g. demo-001) have no hash claim until re-uploaded.
+- Phase 3 code: `domain/fingerprint.py` (`sha256_hex`), `DatasetStatus.DUPLICATE` + META fields `file_hash`/`duplicate_of`/`quarantine_key`; `ProcessDataset` flow = read → hash → claim → validate/clean → Parquet → delete old stats → save stats → `COMPLETED`; ports `FileQuarantine`, `DatasetRepository.claim_file_hash` (returns owner or None) and `delete_stats`; adapters `S3Quarantine` (copy), conditional `put_item` claim, `QUARANTINE_BUCKET`; handler unwraps SQS bodies (S3 `s3:TestEvent` ignored, malformed body raises).
+- Decisions: added status `DUPLICATE` (deviation from the original four statuses, approved by default); quarantine **copies** (no delete permission on the raw bucket); the same dataset_id owning the hash means an SQS retry, not a duplicate; a FAILED file keeps its hash claim (re-upload under a new ID = `DUPLICATE`); bad files are consumed as `FAILED`, infrastructure errors raise so SQS retries then uses the DLQ; stale `STATS#` items are deleted before re-writing stats (closes the Phase 2 gap).
+- Template: `UploadQueue` (visibility 720 s = 6x Lambda timeout, maxReceiveCount 3) + `DeadLetterQueue` (14 days), queue policy limited to this bucket and account (bucket ARN built as a string), S3 notification → queue for `uploads/`, SQS event source batch size 1, `QuarantineBucket` (30-day expiry). DynamoDB permissions are an exact action list (PutItem, GetItem, Query, DeleteItem, BatchWriteItem).
+- **Phase 8 IAM review TODO:** SAM attaches the AWS-managed `AWSLambdaSQSQueueExecutionRole` for the SQS event (covers all queues in the account); `S3WritePolicy`/`S3ReadPolicy` templates include a few actions the code does not use (e.g. `PutObjectAcl`, `PutLifecycleConfiguration`).
+- SQS moves a message to the DLQ on the receive after `maxReceiveCount` is reached, so with a 12-minute visibility timeout a poison message takes ~36 minutes. For a faster demo, lower `VisibilityTimeout`, but keep it at least 6x the Lambda timeout in real use.
+- Shell tip: zsh does not treat `#` as a comment when pasting, so README command blocks contain no inline comments.
