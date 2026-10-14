@@ -5,56 +5,124 @@ student results datasets, then serves the results through an API to a web dashbo
 
 > 🚧 Work in progress, being built phase by phase. See [Roadmap](#roadmap).
 
-## How it works (target architecture)
+## Architecture
 
-```
-Upload ─▶ S3 (raw) ─▶ SQS (+DLQ) ─▶ Trigger Lambda ─▶ Step Functions
-                                                      Validate ─▶ Clean ─▶ Stats ─▶ Anomalies ─▶ Store
-                                                                    │
-                                        S3 (processed, Parquet) ◀───┴───▶ DynamoDB
-                                                                              │
-                                                     React dashboard ◀── API Gateway + Lambda
+```mermaid
+flowchart LR
+    uploader(["Uploader"]) -->|"CSV or JSON"| raw[("S3 raw bucket<br/>uploads/ID/file")]
+    raw -->|"ObjectCreated"| queue[["SQS queue"]]
+    queue -.->|"3 failed receives"| dlq[["Dead-letter queue"]]
+    queue --> trigger["Trigger Lambda<br/>SHA-256 and duplicate check"]
+    trigger -->|"start run"| sfn
+
+    subgraph sfn ["Step Functions workflow"]
+        validate["Validate"] --> clean["Clean"] --> stats["Stats"] --> store["Store"]
+        validate -.->|"bad file or error"| failed["Mark failed"]
+        clean -.->|"error"| failed
+        stats -.->|"error"| failed
+        store -.->|"error"| failed
+    end
+
+    trigger <-->|"hash claim, META"| ddb[("DynamoDB<br/>PipelineTable")]
+    store -->|"stats, COMPLETED"| ddb
+    failed -->|"FAILED"| ddb
+    validate -->|"valid rows"| processed[("S3 processed bucket")]
+    clean -->|"Parquet"| processed
+    failed -->|"copy of bad file"| quarantine[("S3 quarantine bucket")]
+    failed -->|"alert"| sns["SNS topic"] --> email(["Email"])
+
+    stats -.-> anomalies["Detect anomalies<br/>Phase 5"]:::planned
+    ddb -.-> api["API Gateway and Lambda<br/>Phase 6"]:::planned
+    api -.-> dashboard["React dashboard<br/>Phase 7"]:::planned
+
+    classDef planned stroke-dasharray: 5 5,fill:#f4f4f4,color:#555
 ```
 
-## What works today (v0.3.0)
+Solid boxes are built and deployed (up to v0.4.0). Dashed boxes are planned in later phases.
 
+## What works today (v0.4.0)
+
+```mermaid
+flowchart TD
+    begin(["Run starts<br/>input: where the upload is"]) --> validate["Validate<br/>retries: 3 times, after 2s, 4s, 8s"]
+    validate --> valid{"valid file?"}
+    valid -->|"yes"| clean["Clean<br/>3 retries"]
+    clean --> stats["Stats<br/>3 retries"]
+    stats --> store["Store<br/>3 retries"]
+    store --> done(["Run succeeded<br/>dataset COMPLETED"]):::good
+
+    valid -->|"no: bad file"| markfailed["Mark failed<br/>quarantine the file if it is bad,<br/>status FAILED"]
+    validate -->|"error after retries"| markfailed
+    clean -->|"error after retries"| markfailed
+    stats -->|"error after retries"| markfailed
+    store -->|"error after retries"| markfailed
+
+    markfailed --> notify["Notify failure<br/>SNS email"]
+    markfailed -.->|"could not be recorded"| fallback["Fallback message"] --> notify
+    notify --> failedend(["Run ends in Fail<br/>dataset is FAILED"]):::bad
+
+    classDef good fill:#d4edda,stroke:#2e7d32
+    classDef bad fill:#f8d7da,stroke:#c62828
 ```
-Upload ─▶ S3 raw ─▶ SQS queue ─▶ Process Lambda ─┬─▶ S3 processed (Parquet)
-          (uploads/)    │         (+ pandas layer) ├─▶ DynamoDB (META, STATS#, HASH#)
-                        │                          └─▶ S3 quarantine (rejected files)
-                        └─ after 3 failed receives ─▶ dead-letter queue (DLQ)
+
+What one good upload looks like, step by step:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as Uploader
+    participant S3 as S3 raw
+    participant Q as SQS
+    participant T as Trigger Lambda
+    participant D as DynamoDB
+    participant W as Step Functions
+    participant L as Step Lambdas
+    participant P as S3 processed
+
+    U->>S3: upload uploads/ds-1/file.csv
+    S3->>Q: ObjectCreated event
+    Q->>T: message (one upload per call)
+    T->>S3: read the file
+    T->>D: claim the SHA-256 (conditional write)
+    alt another dataset already owns this hash
+        T->>D: save META as DUPLICATE
+        Note over T,W: no run starts
+    else new file
+        T->>W: start the run
+        T->>D: create META as PROCESSING (only if absent)
+    end
+    W->>L: Validate
+    L->>P: save work/ds-1/valid.jsonl
+    W->>L: Clean
+    L->>P: save processed/ds-1/data.parquet
+    W->>L: Stats
+    L->>P: read the Parquet file
+    W->>L: Store
+    L->>D: save STATS items, then META as COMPLETED
 ```
 
 Upload a CSV or JSON file to `uploads/<dataset_id>/<filename>`. S3 sends an event to an SQS
-queue, and the Process Lambda handles one upload at a time:
+queue. A **Trigger Lambda** fingerprints the file (SHA-256) and claims it in DynamoDB with a
+conditional write: if a *different* dataset already owns that hash the upload is recorded as
+`DUPLICATE` (`duplicate_of` names the original) and nothing else happens. Otherwise it starts a
+**Step Functions** state machine ([statemachine/pipeline.asl.json](statemachine/pipeline.asl.json)),
+whose steps are separate Lambdas:
 
-1. **Fingerprints** the file (SHA-256) and claims it in DynamoDB with a conditional write.
-   If a *different* dataset already owns that hash, the upload is recorded as `DUPLICATE`
-   (`duplicate_of` names the original) and nothing else happens. If the *same* dataset owns it,
-   this is a queue retry and processing simply continues.
-2. **Validates.** File-level problems (unreadable UTF-8, wrong extension, no rows, missing
-   columns) → `FAILED`. Row-level problems are counted, and the first 20 are listed in
-   `row_errors`. If fewer than `MinValidRatio` (default 80%) of rows are valid → `FAILED`.
-   Every `FAILED` file is **copied to the quarantine bucket** (`quarantine/<id>/<filename>`).
-3. **Cleans** the valid rows with pandas: trims text, normalises subjects (`maths` → `Maths`,
-   `ict` → `ICT`), casts `year`/`score` to numbers, drops exact duplicates (after normalising).
-4. **Writes Parquet** to `processed/<dataset_id>/data.parquet` in the processed bucket.
-5. **Computes statistics**, deletes any old `STATS#` items of that dataset, and saves the new ones.
-6. Saves the final `META` item. Status flow: `PROCESSING` → `COMPLETED`, `FAILED` or `DUPLICATE`.
-   `COMPLETED` is written last, so a completed dataset always has its Parquet file and stats.
+| Step | What it does | Hands over |
+|---|---|---|
+| **Validate** | File-level checks (readable UTF-8, `.csv`/`.json`, rows, required columns) and row-level checks (the rules below). Saves the valid rows. | S3 key of the valid rows, row counts, the first 20 row errors |
+| **Clean** | pandas: trims text, normalises subjects (`maths` → `Maths`, `ict` → `ICT`), casts `year`/`score`, drops exact duplicates. Writes `processed/<id>/data.parquet`. | the Parquet key, cleaned row count |
+| **Stats** | Per subject and term, overall, top 5 / bottom 5 students, class averages. | the statistics as JSON (about 3 KB) |
+| **Store** | Deletes old `STATS#` items, saves the new ones, then writes `META` as `COMPLETED` (last, so completed means everything is there). | final status |
+| **Mark failed** | Records `FAILED` with the reason. A bad file is also copied to the quarantine bucket; a crashed run is not (the file may be fine). | |
 
-### Reliability
+Steps never pass large data through the workflow (the limit is 256 KB): they hand each other
+S3 keys and small results, and the state machine merges each result into the run's state.
+Every step runs with its own least-privilege role. For example Stats can only read the
+processed bucket, and Store can only use DynamoDB.
 
-| Situation | What happens |
-|---|---|
-| Same file uploaded again under a new ID | `DUPLICATE`, nothing reprocessed. The hash claim is atomic, so simultaneous uploads cannot both win. |
-| Same upload delivered twice by SQS (at-least-once) | Recognised as a retry (same ID owns the hash) and processed again safely. |
-| Broken or mostly-invalid file | `FAILED` with an error message, original copied to the quarantine bucket. The message is consumed (no retries: retrying cannot fix a bad file). |
-| Infrastructure error (S3 or DynamoDB failing, malformed message) | The Lambda raises, SQS retries, and after 3 receives the message goes to the **DLQ** (kept 14 days). |
-| Re-processing an existing dataset ID | Old `STATS#` items are deleted before the new ones are written. |
-
-A failed file also keeps its hash claim, so re-uploading the same broken file under a new ID
-is reported as a `DUPLICATE` of the first one.
+If fewer than `MinValidRatio` (default 80%) of the rows are valid, or the file itself is
+unusable, the dataset is `FAILED`. That is a normal result, not an error, so it is not retried.
 
 | Column | Rule |
 |---|---|
@@ -63,6 +131,30 @@ is reported as a `DUPLICATE` of the first one.
 | `term` | one of `T1`, `T2`, `T3` |
 | `year` | integer, 2000 to the upload year |
 | `score` | number, 0 to 100 |
+
+### Reliability
+
+| Situation | What happens |
+|---|---|
+| Same file uploaded again under a new ID | `DUPLICATE`, no workflow starts. The hash claim is atomic, so simultaneous uploads cannot both win. |
+| The same S3 event delivered twice by SQS (at-least-once) | Same execution name, so no second run starts. |
+| Same bytes uploaded again to the **same** ID later | A new run reprocesses it. The old status stays visible until the new run finishes. |
+| Broken or mostly-invalid file | Validate says `valid=false`, so Mark failed quarantines it, sets `FAILED` with the reason and sends an alert. No retries (retrying cannot fix a bad file). |
+| A step fails temporarily (S3 throttling, timeout) | That step is retried up to 3 more times, waiting 2, 4 then 8 seconds. |
+| A step still fails after its retries | Mark failed sets `FAILED` with a readable reason (no quarantine), then an alert is sent. |
+| Recording the failure fails too | The alert is still sent, with a fallback message. |
+| The Trigger fails (infrastructure error, malformed message) | The Lambda raises, SQS retries, and after 3 receives the message goes to the **DLQ** (kept 14 days). |
+| Re-processing an existing dataset ID | Old `STATS#` items are deleted before the new ones are written. |
+
+A failed file keeps its hash claim, so re-uploading the same broken file under a new ID is
+reported as a `DUPLICATE` of the first one.
+
+### Failure alerts
+
+Failed runs publish to an SNS topic. Pass your address at deploy time to get an email:
+`sam deploy --parameter-overrides AlertEmail=you@example.com`. AWS sends a confirmation link
+you must click once, and until then nothing is delivered. With no address the topic exists but
+has no subscribers.
 
 ### DynamoDB items (table `PipelineTable`)
 
@@ -93,6 +185,28 @@ The Python code follows **clean architecture**. Dependencies only point inward:
 | Application | `src/gradeflow/application/` | Use cases, ports (interfaces) | domain |
 | Infrastructure | `src/gradeflow/infrastructure/` | boto3 adapters (S3, DynamoDB), config | application, domain |
 | Entrypoints | `src/gradeflow/entrypoints/` | Thin Lambda handlers | all of the above |
+
+```mermaid
+flowchart LR
+    subgraph entry ["entrypoints"]
+        handlers["Lambda handlers<br/>trigger, validate, clean,<br/>stats, store, fail"]
+    end
+    subgraph infra ["infrastructure"]
+        adapters["boto3 adapters<br/>S3, DynamoDB, Step Functions<br/>and config loaders"]
+    end
+    subgraph app ["application"]
+        usecases["Use cases<br/>pipeline_steps.py"]
+        ports["Ports (Protocols)<br/>FileStorage, DatasetArtifacts,<br/>DatasetRepository and more"]
+    end
+    subgraph dom ["domain"]
+        rules["Pure rules<br/>validation, cleaning,<br/>statistics, fingerprint"]
+    end
+    handlers --> usecases
+    handlers --> adapters
+    adapters -.->|"implement"| ports
+    usecases --> ports
+    usecases --> rules
+```
 
 Business logic is testable without AWS, and `tests/unit/test_architecture.py` fails the
 build if an inner layer imports boto3 or an outer layer.
@@ -150,7 +264,7 @@ sam build
 sam deploy                    # shows the change set, then asks for confirmation
 ```
 
-Optional parameters, e.g. `sam deploy --parameter-overrides MinValidRatio=0.9 PassMark=40`.
+Optional parameters, e.g. `sam deploy --parameter-overrides MinValidRatio=0.9 PassMark=40 AlertEmail=you@example.com`.
 
 pandas and pyarrow come from the **AWS SDK for pandas** managed Lambda layer (parameter
 `PandasLayerArn`, default is the `ap-south-1` / Python 3.12 / arm64 layer). In another region,
@@ -160,65 +274,91 @@ pick the ARN from <https://aws-sdk-pandas.readthedocs.io/en/stable/layers.html> 
 ### Try it
 
 Paste only the code blocks. (zsh does not treat `#` as a comment when pasting, so no comments
-are included inside them.)
+are included inside them.) First set up the shell helpers:
 
 ```bash
 export AWS_PAGER=""
 out() { aws cloudformation describe-stacks --stack-name gradeflow --region ap-south-1 \
   --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text; }
 BUCKET=$(out RawBucketName); PROCESSED=$(out ProcessedBucketName); QUARANTINE=$(out QuarantineBucketName)
-TABLE=$(out PipelineTableName); QUEUE=$(out UploadQueueUrl); DLQ=$(out DeadLetterQueueUrl)
+TABLE=$(out PipelineTableName); SM=$(out PipelineStateMachineArn); QUEUE=$(out UploadQueueUrl); DLQ=$(out DeadLetterQueueUrl)
 meta() { aws dynamodb get-item --table-name $TABLE --region ap-south-1 \
   --key "{\"PK\":{\"S\":\"DATASET#$1\"},\"SK\":{\"S\":\"META\"}}" \
-  --query "Item.{status:status.S,dup_of:duplicate_of.S,clean:clean_rows.N,hash:file_hash.S,quarantine:quarantine_key.S,error:error_message.S}"; }
-python scripts/generate_sample_data.py
+  --query "Item.{status:status.S,dup_of:duplicate_of.S,clean:clean_rows.N,quarantine:quarantine_key.S,error:error_message.S}"; }
+steps() { aws stepfunctions get-execution-history --execution-arn "$1" --region ap-south-1 \
+  --query "events[?contains(type, 'StateEntered')].stateEnteredEventDetails.name" --output text; }
+last_execution() { aws stepfunctions list-executions --state-machine-arn $SM --region ap-south-1 \
+  --max-results 1 --query "executions[0].executionArn" --output text; }
+python scripts/generate_sample_data.py --seed 7 --out data/sample_seed7.csv
 ```
 
-**1. A good file is processed** (the first run is a cold start that loads pandas):
+`steps $(last_execution)` shows the **newest** run, whichever dataset it belongs to. A duplicate
+starts no run, so always check that the output belongs to the upload you just made.
+
+**1. A good file: every step runs.** Open the Step Functions console (Mumbai) → the state
+machine → the newest run to see the graph with every state green.
 
 ```bash
-aws s3 cp data/student_results.csv s3://$BUCKET/uploads/demo-001/student_results.csv
-sleep 20
-meta demo-001
-aws s3 ls s3://$PROCESSED/processed/demo-001/
+aws s3 cp data/sample_seed7.csv s3://$BUCKET/uploads/demo-1/sample_seed7.csv
+sleep 40
+meta demo-1
+steps $(last_execution)
 aws dynamodb get-item --table-name $TABLE --region ap-south-1 \
-  --key '{"PK":{"S":"DATASET#demo-001"},"SK":{"S":"STATS#OVERALL"}}' \
+  --key '{"PK":{"S":"DATASET#demo-1"},"SK":{"S":"STATS#OVERALL"}}' \
   --query "Item.{count:count.N,mean:mean.N,median:median.N,pass_rate:pass_rate.N,students:student_count.N}"
 ```
 
-Expect `COMPLETED`, clean 891, a Parquet file, and mean 62.43 / pass rate 78.34 / 60 students.
+Expect `COMPLETED`, clean 891, steps `Validate IsValid Clean Stats Store`, and mean 64.07 /
+median 64.5 / pass rate 89.23 / 60 students.
 
-**2. The same file under a new ID is skipped:**
-
-```bash
-aws s3 cp data/student_results.csv s3://$BUCKET/uploads/demo-002/student_results.csv
-sleep 15
-meta demo-002
-aws s3 ls s3://$PROCESSED/processed/demo-002/
-```
-
-Expect `DUPLICATE` with `dup_of` = demo-001, and no Parquet file for demo-002.
-
-**3. A broken file is quarantined:**
+**2. The same file under a new ID is skipped** (no new run starts):
 
 ```bash
-printf 'student_id,score\nS00001,50\n' > /tmp/broken.csv
-aws s3 cp /tmp/broken.csv s3://$BUCKET/uploads/demo-003/broken.csv
+aws s3 cp data/sample_seed7.csv s3://$BUCKET/uploads/demo-2/sample_seed7.csv
 sleep 15
-meta demo-003
-aws s3 ls s3://$QUARANTINE/quarantine/demo-003/
+meta demo-2
 ```
 
-Expect `FAILED`, an error naming the missing columns, and the file in the quarantine bucket.
+Expect `DUPLICATE` with `dup_of` = demo-1.
 
-**4. A poison message ends up in the DLQ** (about 25 to 40 minutes: each retry waits for
-the 12-minute visibility timeout):
+**3. A broken file takes the failure branch.** The bytes must be new: this exact content may
+already be claimed by an earlier test.
+
+```bash
+printf 'student_id,score\nS00002,%s\n' $RANDOM > /tmp/broken.csv
+aws s3 cp /tmp/broken.csv s3://$BUCKET/uploads/demo-3/broken.csv
+sleep 30
+meta demo-3
+steps $(last_execution)
+aws s3 ls s3://$QUARANTINE/quarantine/demo-3/
+```
+
+Expect `FAILED` (missing required columns), a quarantine key, steps
+`Validate IsValid MarkFailed NotifyFailure PipelineFailed`, and the file in quarantine. The run
+itself ends `FAILED` (red in the console): that is how a handled failure looks.
+
+**4. Retries and the catch.** Start a run by hand for a file that does not exist:
+
+```bash
+ACCT=$(aws sts get-caller-identity --query Account --output text)
+aws stepfunctions start-execution --state-machine-arn $SM --name manual-missing-1 --region ap-south-1 \
+  --input "{\"dataset_id\":\"demo-4\",\"bucket\":\"$BUCKET\",\"key\":\"uploads/demo-4/missing.csv\",\"uploaded_at\":\"2026-01-01T10:00:00+00:00\",\"file_hash\":\"$(printf '1%.0s' {1..64})\"}"
+sleep 45
+meta demo-4
+steps "arn:aws:states:ap-south-1:${ACCT}:execution:${SM##*:}:manual-missing-1"
+```
+
+Expect `FAILED` with `processing failed (NoSuchKey: …)` and no quarantine. In the console the
+Validate step shows 4 attempts (the first try plus 3 retries, about 2, 4 and 8 seconds apart).
+
+**5. A poison message ends up in the DLQ** (about 9 minutes: each retry waits for the 3-minute
+visibility timeout):
 
 ```bash
 aws sqs send-message --queue-url $QUEUE --message-body 'not json' --region ap-south-1
 ```
 
-Later, check the DLQ and purge it afterwards:
+Later, check the DLQ, then purge it:
 
 ```bash
 aws sqs get-queue-attributes --queue-url $DLQ --region ap-south-1 \
@@ -226,7 +366,8 @@ aws sqs get-queue-attributes --queue-url $DLQ --region ap-south-1 \
 aws sqs purge-queue --queue-url $DLQ --region ap-south-1
 ```
 
-Lambda logs: `sam logs -n ProcessFunction --stack-name gradeflow --region ap-south-1 --tail`
+Lambda logs: `sam logs -n ValidateFunction --stack-name gradeflow --region ap-south-1 --tail`
+(use `TriggerFunction`, `CleanFunction`, `StatsFunction`, `StoreFunction` or `FailFunction`).
 
 ### Clean up
 
@@ -243,17 +384,35 @@ sam delete --stack-name gradeflow --region ap-south-1
 
 At portfolio-demo volume this stays within the AWS Free Tier:
 
-- Lambda runs on arm64 with 512 MB (pandas needs more memory).
+- Lambda runs on arm64. Memory is sized per step (see Limits): 512 MB Trigger, 2048 MB
+  Validate and Clean, 1024 MB Stats, 256 MB Store and Fail. Lambda bills memory times time:
+  the 25 MB test file used about 30 GB-seconds in total, against a free tier of 400,000
+  GB-seconds a month (roughly 13,000 uploads of that size; typical small files use 1 or 2).
+- Step Functions: about 10 state transitions per run, against a free tier of 4,000 a month.
 - DynamoDB is on-demand, so it costs nothing when idle.
-- Raw and quarantined files expire after 30 days.
-- SQS adds a small request volume, well inside its free tier of 1 million requests a month.
+- Raw and quarantined files expire after 30 days, and the temporary `work/` files after 7.
+- SQS and SNS volumes are far inside their free tiers.
 - Logs are kept for 14 days.
 
 ### Limits
 
-Lambda reads the whole file into memory, builds the Parquet file in memory too, and has a
-15-minute ceiling (this function uses 512 MB and a 120 s timeout). The target is files up to about 50 MB. Much larger files would need chunked
-processing, AWS Glue or Fargate, which are out of scope for this project.
+Each step holds the file in memory as Python objects, so memory grows with the number of
+rows: measured at about **1.3 MB per 1,000 rows plus about 200 MB** for the runtime and pandas.
+
+Measured on AWS with a 25 MB CSV (525,004 rows): the run finished in 29 seconds with these peak
+memory figures.
+
+| Function | Memory | Peak used (25 MB file) |
+|---|---|---|
+| Trigger | 512 MB | 247 MB |
+| Validate | 2048 MB | 842 MB |
+| Clean | 2048 MB | 885 MB |
+| Stats | 1024 MB | 364 MB |
+
+Extrapolating the same figures, a 50 MB file (about a million rows) should need roughly 1.5 to
+1.6 GB in Clean, which fits in 2048 MB. **That size has not been run**: 25 MB is the largest file
+verified. Files much beyond 50 MB would need chunked processing, AWS Glue or Fargate, which are
+out of scope for this project. Each Lambda also has a 15-minute ceiling (these use 30 to 120 s).
 
 ## Roadmap
 
@@ -261,7 +420,7 @@ processing, AWS Glue or Fargate, which are out of scope for this project.
 - [x] Phase 1: MVP pipeline (`v0.1.0`)
 - [x] Phase 2: Cleaning & statistics (`v0.2.0`)
 - [x] Phase 3: Reliability: SQS, DLQ, idempotency, quarantine (`v0.3.0`)
-- [ ] Phase 4: Orchestration with Step Functions (`v0.4.0`)
+- [x] Phase 4: Orchestration with Step Functions (`v0.4.0`)
 - [ ] Phase 5: Anomaly detection, rule-based + Isolation Forest (`v0.5.0`)
 - [ ] Phase 6: Analytics API (`v0.6.0`)
 - [ ] Phase 7: Dashboard (`v0.7.0`)
