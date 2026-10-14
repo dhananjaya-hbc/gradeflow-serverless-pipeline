@@ -18,6 +18,7 @@ class Config:
 
     table_name: str
     processed_bucket: str
+    quarantine_bucket: str
     min_valid_ratio: float
     pass_mark: float
 
@@ -28,6 +29,7 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
     return Config(
         table_name=_required(env, "TABLE_NAME"),
         processed_bucket=_required(env, "PROCESSED_BUCKET"),
+        quarantine_bucket=_required(env, "QUARANTINE_BUCKET"),
         min_valid_ratio=_number(env, "MIN_VALID_RATIO", DEFAULT_MIN_VALID_RATIO, 0.0, 1.0),
         pass_mark=_number(env, "PASS_MARK", DEFAULT_PASS_MARK, 0.0, 100.0),
     )
