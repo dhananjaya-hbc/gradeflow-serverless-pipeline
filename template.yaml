@@ -235,6 +235,7 @@ Resources:
     Properties:
       Description: Reads each upload from SQS, skips duplicate files, starts the workflow.
       Handler: gradeflow.entrypoints.trigger_handler.handler
+      MemorySize: 512 # holds the whole file in memory to fingerprint it (209 MB used at idle)
       Timeout: 30
       Environment:
         Variables:
@@ -263,7 +264,10 @@ Resources:
     Properties:
       Description: Workflow step 1, parses and validates the file, saves the valid rows.
       Handler: gradeflow.entrypoints.validate_handler.handler
-      MemorySize: 512 # the whole file is parsed into memory
+      # The whole file is parsed into Python dicts. Measured about 1.4 MB per 1,000 rows
+      # (a 50 MB CSV is roughly a million rows), on top of ~200 MB for the runtime and pandas.
+      # Memory also scales CPU, so big files run faster, and the cost stays tiny.
+      MemorySize: 2048
       Timeout: 120
       Environment:
         Variables:
@@ -280,7 +284,7 @@ Resources:
     Properties:
       Description: Workflow step 2, cleans the valid rows and writes the Parquet file.
       Handler: gradeflow.entrypoints.clean_handler.handler
-      MemorySize: 512 # pandas
+      MemorySize: 2048 # rows as dicts plus a DataFrame at the same time: the peak of the pipeline
       Timeout: 120
       Environment:
         Variables:
@@ -296,7 +300,7 @@ Resources:
     Properties:
       Description: Workflow step 3, computes statistics from the cleaned data.
       Handler: gradeflow.entrypoints.stats_handler.handler
-      MemorySize: 512 # pandas
+      MemorySize: 1024 # a DataFrame of the clean rows
       Timeout: 120
       Environment:
         Variables:
