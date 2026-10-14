@@ -1,14 +1,16 @@
 """Ports: interfaces the use cases need from the outside world.
 
-Infrastructure adapters (S3, DynamoDB) implement these; tests use in-memory fakes.
+Infrastructure adapters (S3, DynamoDB, Step Functions) implement these; tests use in-memory
+fakes.
 """
 
-from typing import Protocol
+from typing import Any, Protocol
 
 import pandas as pd
 
 from gradeflow.domain.dataset import DatasetMeta
 from gradeflow.domain.statistics import DatasetStats
+from gradeflow.domain.validation import Row
 
 
 class FileStorage(Protocol):
@@ -27,19 +29,35 @@ class FileQuarantine(Protocol):
         ...
 
 
-class ProcessedDataWriter(Protocol):
-    """Stores cleaned data for later analysis."""
+class DatasetArtifacts(Protocol):
+    """Files the pipeline steps hand to each other (Step Functions payloads are too small)."""
 
-    def write(self, dataset_id: str, data: pd.DataFrame) -> str:
-        """Save the cleaned data and return the key it was written to."""
+    def save_valid_rows(self, dataset_id: str, rows: list[Row]) -> str:
+        """Store the validated (not yet cleaned) rows and return their key."""
+        ...
+
+    def load_valid_rows(self, key: str) -> list[Row]:
+        """Load rows saved by save_valid_rows."""
+        ...
+
+    def save_clean_data(self, dataset_id: str, data: pd.DataFrame) -> str:
+        """Store the final cleaned data (Parquet) and return its key."""
+        ...
+
+    def load_clean_data(self, key: str) -> pd.DataFrame:
+        """Load data saved by save_clean_data."""
         ...
 
 
 class DatasetRepository(Protocol):
-    """Persists dataset metadata and statistics."""
+    """Persists dataset metadata, statistics and file-hash claims."""
 
     def save_meta(self, meta: DatasetMeta) -> None:
         """Create or overwrite the META record for a dataset."""
+        ...
+
+    def create_meta_if_absent(self, meta: DatasetMeta) -> bool:
+        """Create the META record only if the dataset has none yet. True if created."""
         ...
 
     def save_stats(self, dataset_id: str, stats: DatasetStats) -> None:
@@ -56,4 +74,12 @@ class DatasetRepository(Protocol):
         Returns None if the claim succeeded, or the owning dataset_id if the content was
         claimed before. The owner can be `dataset_id` itself (a retry of the same upload).
         """
+        ...
+
+
+class WorkflowStarter(Protocol):
+    """Starts the processing workflow for one upload."""
+
+    def start(self, name: str, payload: dict[str, Any]) -> bool:
+        """Start an execution called `name`. False if one with that name already exists."""
         ...
