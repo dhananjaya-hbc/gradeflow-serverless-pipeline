@@ -1,6 +1,6 @@
 """Integration tests for the boto3 adapters, against moto's in-memory fake AWS."""
 
-import io
+import json
 from collections.abc import Iterator
 from decimal import Decimal
 
@@ -8,6 +8,7 @@ import boto3
 import pandas as pd
 import pytest
 from boto3.dynamodb.conditions import Key
+from botocore.exceptions import ClientError
 from moto import mock_aws
 
 from gradeflow.domain.dataset import DatasetMeta, DatasetStatus
@@ -18,9 +19,10 @@ from gradeflow.domain.statistics import (
     SubjectTermStats,
 )
 from gradeflow.infrastructure.dynamodb_repository import DynamoDbDatasetRepository
-from gradeflow.infrastructure.s3_parquet_writer import S3ParquetWriter
+from gradeflow.infrastructure.s3_artifacts import S3DatasetArtifacts
 from gradeflow.infrastructure.s3_quarantine import S3Quarantine
 from gradeflow.infrastructure.s3_storage import S3FileStorage
+from gradeflow.infrastructure.step_functions_starter import StepFunctionsStarter
 
 REGION = "ap-south-1"
 TABLE = "PipelineTable"
@@ -259,13 +261,18 @@ def test_save_stats_handles_more_than_one_batch(table) -> None:
     assert table.query(KeyConditionExpression=Key("PK").eq("DATASET#ds-1"))["Count"] == 41
 
 
-# --- S3 Parquet ----------------------------------------------------------------------
+# --- S3 artifacts (work files and final Parquet) -------------------------------------
 
 
-def test_parquet_writer_round_trip() -> None:
+@pytest.fixture
+def processed_bucket():
     s3 = boto3.client("s3")
     s3.create_bucket(Bucket="processed", CreateBucketConfiguration={"LocationConstraint": REGION})
-    data = pd.DataFrame(
+    return s3
+
+
+def clean_frame() -> pd.DataFrame:
+    return pd.DataFrame(
         {
             "student_id": ["S00001", "S00002"],
             "student_name": ["Amal Perera", "Nimal Silva"],
@@ -277,13 +284,139 @@ def test_parquet_writer_round_trip() -> None:
         }
     )
 
-    key = S3ParquetWriter("processed").write("ds-1", data)
+
+def test_clean_data_round_trip(processed_bucket) -> None:
+    artifacts = S3DatasetArtifacts("processed")
+    data = clean_frame()
+
+    key = artifacts.save_clean_data("ds-1", data)
 
     assert key == "processed/ds-1/data.parquet"
-    obj = s3.get_object(Bucket="processed", Key=key)
-    assert obj["ContentType"] == "application/vnd.apache.parquet"
-    read_back = pd.read_parquet(io.BytesIO(obj["Body"].read()))
-    pd.testing.assert_frame_equal(read_back, data)  # same values, columns and dtypes
+    stored = processed_bucket.get_object(Bucket="processed", Key=key)
+    assert stored["ContentType"] == "application/vnd.apache.parquet"
+    pd.testing.assert_frame_equal(artifacts.load_clean_data(key), data)  # values and dtypes
+
+
+def test_valid_rows_round_trip_as_json_lines(processed_bucket) -> None:
+    artifacts = S3DatasetArtifacts("processed")
+    rows = [
+        {"student_id": "S00001", "student_name": "Amal Perera", "year": "2025", "score": "78.5"},
+        {
+            "student_id": "S00002",
+            "student_name": "Ruwan \u0dc1\u0dca\u0dbb\u0dd3",
+            "year": 2025,
+            "score": 40,
+        },
+        {"student_id": "S00003", "student_name": None, "extra": 1.5, "score": 0},
+    ]
+
+    key = artifacts.save_valid_rows("ds-1", rows)
+
+    assert key == "work/ds-1/valid.jsonl"
+    body = processed_bucket.get_object(Bucket="processed", Key=key)["Body"].read().decode()
+    assert len(body.splitlines()) == 3  # one JSON object per line
+    assert all(json.loads(line) for line in body.splitlines())
+    assert artifacts.load_valid_rows(key) == rows  # strings, numbers, None and unicode survive
+
+
+def test_valid_rows_with_newlines_quotes_and_commas_stay_on_one_line(processed_bucket) -> None:
+    artifacts = S3DatasetArtifacts("processed")
+    rows = [{"student_name": 'A "quoted"\nname, with comma', "score": "50"}]
+
+    key = artifacts.save_valid_rows("ds-1", rows)
+
+    body = processed_bucket.get_object(Bucket="processed", Key=key)["Body"].read().decode()
+    assert len(body.splitlines()) == 1  # the newline inside the value is escaped
+    assert artifacts.load_valid_rows(key) == rows
+
+
+def test_empty_valid_rows_round_trip(processed_bucket) -> None:
+    artifacts = S3DatasetArtifacts("processed")
+    key = artifacts.save_valid_rows("ds-1", [])
+    assert artifacts.load_valid_rows(key) == []
+
+
+def test_datasets_do_not_share_artifact_keys(processed_bucket) -> None:
+    artifacts = S3DatasetArtifacts("processed")
+    key_1 = artifacts.save_valid_rows("ds-1", [{"score": "1"}])
+    key_2 = artifacts.save_valid_rows("ds-2", [{"score": "2"}])
+
+    assert artifacts.load_valid_rows(key_1) == [{"score": "1"}]
+    assert artifacts.load_valid_rows(key_2) == [{"score": "2"}]
+
+
+def test_loading_a_missing_artifact_raises(processed_bucket) -> None:
+    with pytest.raises(processed_bucket.exceptions.NoSuchKey):
+        S3DatasetArtifacts("processed").load_valid_rows("work/nope/valid.jsonl")
+
+
+# --- Step Functions starter ----------------------------------------------------------
+
+
+@pytest.fixture
+def state_machine() -> str:
+    """A trivial state machine, enough for start_execution to work against."""
+    definition = json.dumps({"StartAt": "Done", "States": {"Done": {"Type": "Pass", "End": True}}})
+    return boto3.client("stepfunctions").create_state_machine(
+        name="pipeline", definition=definition, roleArn="arn:aws:iam::123456789012:role/test"
+    )["stateMachineArn"]
+
+
+def test_start_runs_the_state_machine_with_the_payload(state_machine) -> None:
+    payload = {"dataset_id": "ds-1", "key": "uploads/ds-1/a.csv"}
+
+    assert StepFunctionsStarter(state_machine).start("ds-1-run", payload) is True
+
+    sfn = boto3.client("stepfunctions")
+    [execution] = sfn.list_executions(stateMachineArn=state_machine)["executions"]
+    assert execution["name"] == "ds-1-run"
+    described = sfn.describe_execution(executionArn=execution["executionArn"])
+    assert json.loads(described["input"]) == payload
+
+
+def test_start_with_an_existing_name_returns_false_and_starts_nothing(state_machine) -> None:
+    starter = StepFunctionsStarter(state_machine)
+    assert starter.start("ds-1-run", {"n": 1}) is True
+
+    assert starter.start("ds-1-run", {"n": 1}) is False
+
+    executions = boto3.client("stepfunctions").list_executions(stateMachineArn=state_machine)
+    assert len(executions["executions"]) == 1
+
+
+def test_start_with_different_names_starts_both(state_machine) -> None:
+    starter = StepFunctionsStarter(state_machine)
+    assert starter.start("run-a", {}) is True
+    assert starter.start("run-b", {}) is True
+
+
+def test_start_raises_other_errors_so_sqs_can_retry() -> None:
+    missing = "arn:aws:states:ap-south-1:123456789012:stateMachine:does-not-exist"
+    with pytest.raises(ClientError):
+        StepFunctionsStarter(missing).start("run-1", {})
+
+
+# --- create_meta_if_absent -----------------------------------------------------------
+
+
+def test_create_meta_if_absent_creates_only_once(table) -> None:
+    repository = DynamoDbDatasetRepository(TABLE)
+
+    assert repository.create_meta_if_absent(make_meta(status=DatasetStatus.PROCESSING)) is True
+    assert repository.create_meta_if_absent(make_meta(status=DatasetStatus.FAILED)) is False
+
+    item = table.get_item(Key={"PK": "DATASET#ds-1", "SK": "META"})["Item"]
+    assert item["status"] == "PROCESSING"
+
+
+def test_create_meta_if_absent_never_overwrites_a_finished_dataset(table) -> None:
+    repository = DynamoDbDatasetRepository(TABLE)
+    repository.save_meta(make_meta(status=DatasetStatus.COMPLETED))
+
+    assert repository.create_meta_if_absent(make_meta(status=DatasetStatus.PROCESSING)) is False
+
+    item = table.get_item(Key={"PK": "DATASET#ds-1", "SK": "META"})["Item"]
+    assert item["status"] == "COMPLETED"
 
 
 # --- idempotency: file hash claims ---------------------------------------------------
