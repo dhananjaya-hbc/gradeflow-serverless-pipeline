@@ -4,6 +4,7 @@ Trigger ─▶ Validate ─▶ Clean ─▶ Stats ─▶ Store          (happy p
               └─ invalid file / error ─▶ Reject          (failure branch)
 """
 
+import json
 import re
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -266,6 +267,23 @@ def _require[T](value: T | None, name: str) -> T:
 
 def _failure_message(state: PipelineState, validation: ValidationOutcome) -> str:
     if state.error is not None:
-        detail = f"{state.error.get('Error', 'Error')}: {state.error.get('Cause', '')}"
-        return f"processing failed ({detail})"[:MAX_ERROR_MESSAGE]
+        error_type, detail = _crash_detail(state.error)
+        return f"processing failed ({error_type}: {detail})"[:MAX_ERROR_MESSAGE]
     return validation.error_message or "file rejected"
+
+
+def _crash_detail(error: dict) -> tuple[str, str]:
+    """Readable (type, message) from a Step Functions error.
+
+    For a Lambda that raised, `Cause` is a JSON document with the message and a stack
+    trace. Only the message belongs in a status shown to users; the trace stays in the
+    execution history and CloudWatch.
+    """
+    error_type, cause = error.get("Error", "Error"), error.get("Cause", "")
+    try:
+        parsed = json.loads(cause)
+    except (TypeError, ValueError):
+        return error_type, str(cause)
+    if isinstance(parsed, dict) and "errorMessage" in parsed:
+        return str(parsed.get("errorType") or error_type), str(parsed["errorMessage"])
+    return error_type, str(cause)
