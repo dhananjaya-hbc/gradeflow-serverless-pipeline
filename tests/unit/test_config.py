@@ -4,7 +4,11 @@ import pytest
 
 from gradeflow.infrastructure.config import Config, ConfigError, load_config
 
-REQUIRED = {"TABLE_NAME": "PipelineTable", "PROCESSED_BUCKET": "processed-bucket"}
+REQUIRED = {
+    "TABLE_NAME": "PipelineTable",
+    "PROCESSED_BUCKET": "processed-bucket",
+    "QUARANTINE_BUCKET": "quarantine-bucket",
+}
 
 
 def test_loads_values() -> None:
@@ -12,6 +16,7 @@ def test_loads_values() -> None:
     assert config == Config(
         table_name="PipelineTable",
         processed_bucket="processed-bucket",
+        quarantine_bucket="quarantine-bucket",
         min_valid_ratio=0.9,
         pass_mark=40.0,
     )
@@ -26,13 +31,18 @@ def test_defaults() -> None:
 def test_reads_os_environ_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TABLE_NAME", "FromEnv")
     monkeypatch.setenv("PROCESSED_BUCKET", "bucket-from-env")
+    monkeypatch.setenv("QUARANTINE_BUCKET", "quarantine-from-env")
     monkeypatch.delenv("MIN_VALID_RATIO", raising=False)
     monkeypatch.delenv("PASS_MARK", raising=False)
     config = load_config()
-    assert (config.table_name, config.processed_bucket) == ("FromEnv", "bucket-from-env")
+    assert (config.table_name, config.processed_bucket, config.quarantine_bucket) == (
+        "FromEnv",
+        "bucket-from-env",
+        "quarantine-from-env",
+    )
 
 
-@pytest.mark.parametrize("name", ["TABLE_NAME", "PROCESSED_BUCKET"])
+@pytest.mark.parametrize("name", ["TABLE_NAME", "PROCESSED_BUCKET", "QUARANTINE_BUCKET"])
 @pytest.mark.parametrize("value", [None, "  "])
 def test_missing_required_value(name: str, value: str | None) -> None:
     env = {k: v for k, v in REQUIRED.items() if k != name}
