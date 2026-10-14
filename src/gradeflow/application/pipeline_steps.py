@@ -155,8 +155,10 @@ class CleanStep:
         self._artifacts = artifacts
 
     def execute(self, state: PipelineState) -> CleaningOutcome:
-        assert state.validation is not None and state.validation.valid_key is not None
-        rows = self._artifacts.load_valid_rows(state.validation.valid_key)
+        validation = _require(state.validation, "validation")
+        rows = self._artifacts.load_valid_rows(
+            _require(validation.valid_key, "validation.valid_key")
+        )
         cleaned = clean_rows(rows)
         processed_key = self._artifacts.save_clean_data(state.dataset_id, cleaned.data)
         return CleaningOutcome(
@@ -177,8 +179,8 @@ class StatsStep:
         self._pass_mark = pass_mark
 
     def execute(self, state: PipelineState) -> dict:
-        assert state.cleaning is not None
-        data = self._artifacts.load_clean_data(state.cleaning.processed_key)
+        cleaning = _require(state.cleaning, "cleaning")
+        data = self._artifacts.load_clean_data(cleaning.processed_key)
         return stats_to_dict(compute_stats(data, self._pass_mark))
 
 
@@ -192,22 +194,24 @@ class StoreStep:
         self._repository = repository
 
     def execute(self, state: PipelineState) -> DatasetMeta:
-        assert state.validation and state.cleaning and state.stats is not None
+        validation = _require(state.validation, "validation")
+        cleaning = _require(state.cleaning, "cleaning")
+        stats = _require(state.stats, "stats")
         # Re-processing an ID must not leave stats of an earlier upload behind.
         self._repository.delete_stats(state.dataset_id)
-        self._repository.save_stats(state.dataset_id, stats_from_dict(state.stats))
+        self._repository.save_stats(state.dataset_id, stats_from_dict(stats))
         meta = DatasetMeta(
             dataset_id=state.dataset_id,
             filename=state.filename,
             uploaded_at=state.uploaded_at,
             status=DatasetStatus.COMPLETED,
-            total_rows=state.validation.total_rows,
-            valid_rows=state.validation.valid_rows,
-            invalid_rows=state.validation.invalid_rows,
-            row_errors=state.validation.row_errors,
-            clean_rows=state.cleaning.clean_rows,
-            duplicates_removed=state.cleaning.duplicates_removed,
-            processed_key=state.cleaning.processed_key,
+            total_rows=validation.total_rows,
+            valid_rows=validation.valid_rows,
+            invalid_rows=validation.invalid_rows,
+            row_errors=validation.row_errors,
+            clean_rows=cleaning.clean_rows,
+            duplicates_removed=cleaning.duplicates_removed,
+            processed_key=cleaning.processed_key,
             file_hash=state.file_hash,
         )
         self._repository.save_meta(meta)
@@ -249,6 +253,15 @@ class RejectDataset:
         )
         self._repository.save_meta(meta)
         return meta
+
+
+def _require[T](value: T | None, name: str) -> T:
+    """Return a state section, or fail loudly if the state machine did not provide it."""
+    if value is None:
+        raise ValueError(
+            f"pipeline state has no '{name}': the state machine passed the wrong input"
+        )
+    return value
 
 
 def _failure_message(state: PipelineState, validation: ValidationOutcome) -> str:
