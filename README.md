@@ -8,30 +8,18 @@ student results datasets, then serves the results through an API to a web dashbo
 ## Architecture
 
 ```mermaid
-flowchart LR
-    uploader(["Uploader"]) -->|"CSV or JSON"| raw[("S3 raw bucket<br/>uploads/ID/file")]
-    raw -->|"ObjectCreated"| queue[["SQS queue"]]
-    queue -.->|"3 failed receives"| dlq[["Dead-letter queue"]]
-    queue --> trigger["Trigger Lambda<br/>SHA-256 and duplicate check"]
-    trigger -->|"start run"| sfn
-
-    subgraph sfn ["Step Functions workflow"]
-        validate["Validate"] --> clean["Clean"] --> stats["Stats"] --> store["Store"]
-        validate -.->|"bad file or error"| failed["Mark failed"]
-        clean -.->|"error"| failed
-        stats -.->|"error"| failed
-        store -.->|"error"| failed
-    end
-
-    trigger <-->|"hash claim, META"| ddb[("DynamoDB<br/>PipelineTable")]
-    store -->|"stats, COMPLETED"| ddb
-    failed -->|"FAILED"| ddb
-    validate -->|"valid rows"| processed[("S3 processed bucket")]
-    clean -->|"Parquet"| processed
-    failed -->|"copy of bad file"| quarantine[("S3 quarantine bucket")]
-    failed -->|"alert"| sns["SNS topic"] --> email(["Email"])
-
-    stats -.-> anomalies["Detect anomalies<br/>Phase 5"]:::planned
+flowchart TD
+    uploader(["Uploader"]) -->|"CSV or JSON"| raw[("S3 raw bucket")]
+    raw -->|"upload event"| queue[["SQS queue"]]
+    queue -.->|"after 3 failed tries"| dlq[["Dead-letter queue"]]
+    queue --> trigger["Trigger Lambda<br/>duplicate check"]
+    trigger -->|"start a run"| workflow["Step Functions workflow<br/>Validate, Clean, Stats, Store"]
+    trigger <-->|"hash claim"| ddb[("DynamoDB")]
+    workflow -->|"stats and status"| ddb
+    workflow -->|"Parquet"| processed[("S3 processed bucket")]
+    workflow -->|"bad files"| quarantine[("S3 quarantine bucket")]
+    workflow -->|"failure alert"| sns["SNS email alert"]
+    workflow -.-> anomalies["Detect anomalies<br/>Phase 5"]:::planned
     ddb -.-> api["API Gateway and Lambda<br/>Phase 6"]:::planned
     api -.-> dashboard["React dashboard<br/>Phase 7"]:::planned
 
@@ -44,25 +32,24 @@ Solid boxes are built and deployed (up to v0.4.0). Dashed boxes are planned in l
 
 ```mermaid
 flowchart TD
-    begin(["Run starts<br/>input: where the upload is"]) --> validate["Validate<br/>retries: 3 times, after 2s, 4s, 8s"]
-    validate --> valid{"valid file?"}
-    valid -->|"yes"| clean["Clean<br/>3 retries"]
-    clean --> stats["Stats<br/>3 retries"]
-    stats --> store["Store<br/>3 retries"]
+    begin(["Run starts<br/>input: where the upload is"]) --> validate
+
+    subgraph steps ["Workflow steps: each is retried 3 times (after 2s, 4s, 8s)"]
+        validate["Validate"] --> valid{"valid file?"}
+        valid -->|"yes"| clean["Clean"]
+        clean --> stats["Stats"]
+        stats --> store["Store"]
+    end
+
     store --> done(["Run succeeded<br/>dataset COMPLETED"]):::good
-
-    valid -->|"no: bad file"| markfailed["Mark failed<br/>quarantine the file if it is bad,<br/>status FAILED"]
-    validate -->|"error after retries"| markfailed
-    clean -->|"error after retries"| markfailed
-    stats -->|"error after retries"| markfailed
-    store -->|"error after retries"| markfailed
-
+    valid -->|"no: bad file"| markfailed["Mark failed<br/>quarantine a bad file, status FAILED"]
+    steps -->|"error after retries"| markfailed
     markfailed --> notify["Notify failure<br/>SNS email"]
     markfailed -.->|"could not be recorded"| fallback["Fallback message"] --> notify
     notify --> failedend(["Run ends in Fail<br/>dataset is FAILED"]):::bad
 
-    classDef good fill:#d4edda,stroke:#2e7d32
-    classDef bad fill:#f8d7da,stroke:#c62828
+    classDef good fill:#d4edda,stroke:#2e7d32,color:#1b1b1b
+    classDef bad fill:#f8d7da,stroke:#c62828,color:#1b1b1b
 ```
 
 What one good upload looks like, step by step:
@@ -187,25 +174,12 @@ The Python code follows **clean architecture**. Dependencies only point inward:
 | Entrypoints | `src/gradeflow/entrypoints/` | Thin Lambda handlers | all of the above |
 
 ```mermaid
-flowchart LR
-    subgraph entry ["entrypoints"]
-        handlers["Lambda handlers<br/>trigger, validate, clean,<br/>stats, store, fail"]
-    end
-    subgraph infra ["infrastructure"]
-        adapters["boto3 adapters<br/>S3, DynamoDB, Step Functions<br/>and config loaders"]
-    end
-    subgraph app ["application"]
-        usecases["Use cases<br/>pipeline_steps.py"]
-        ports["Ports (Protocols)<br/>FileStorage, DatasetArtifacts,<br/>DatasetRepository and more"]
-    end
-    subgraph dom ["domain"]
-        rules["Pure rules<br/>validation, cleaning,<br/>statistics, fingerprint"]
-    end
-    handlers --> usecases
-    handlers --> adapters
+flowchart TD
+    handlers["entrypoints<br/>Lambda handlers"] --> usecases["application<br/>use cases"]
+    handlers --> adapters["infrastructure<br/>boto3 adapters and config"]
+    usecases --> ports["application<br/>ports (Protocols)"]
+    usecases --> rules["domain<br/>pure rules"]
     adapters -.->|"implement"| ports
-    usecases --> ports
-    usecases --> rules
 ```
 
 Business logic is testable without AWS, and `tests/unit/test_architecture.py` fails the
