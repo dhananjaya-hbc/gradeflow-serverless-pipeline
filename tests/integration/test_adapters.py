@@ -19,6 +19,7 @@ from gradeflow.domain.statistics import (
 )
 from gradeflow.infrastructure.dynamodb_repository import DynamoDbDatasetRepository
 from gradeflow.infrastructure.s3_parquet_writer import S3ParquetWriter
+from gradeflow.infrastructure.s3_quarantine import S3Quarantine
 from gradeflow.infrastructure.s3_storage import S3FileStorage
 
 REGION = "ap-south-1"
@@ -130,6 +131,22 @@ def test_completed_meta_stores_cleaning_results(table) -> None:
     item = table.get_item(Key={"PK": "DATASET#ds-1", "SK": "META"})["Item"]
     assert (item["clean_rows"], item["duplicates_removed"]) == (8, 1)
     assert item["processed_key"] == "processed/ds-1/data.parquet"
+
+
+def test_meta_stores_hash_duplicate_and_quarantine_fields(table) -> None:
+    meta = make_meta(
+        status=DatasetStatus.DUPLICATE,
+        file_hash="a" * 64,
+        duplicate_of="ds-0",
+        quarantine_key="quarantine/ds-1/results.csv",
+    )
+    DynamoDbDatasetRepository(TABLE).save_meta(meta)
+
+    item = table.get_item(Key={"PK": "DATASET#ds-1", "SK": "META"})["Item"]
+    assert item["status"] == "DUPLICATE"
+    assert item["file_hash"] == "a" * 64
+    assert item["duplicate_of"] == "ds-0"
+    assert item["quarantine_key"] == "quarantine/ds-1/results.csv"
 
 
 def test_failed_meta_stores_error_message(table) -> None:
@@ -267,3 +284,107 @@ def test_parquet_writer_round_trip() -> None:
     assert obj["ContentType"] == "application/vnd.apache.parquet"
     read_back = pd.read_parquet(io.BytesIO(obj["Body"].read()))
     pd.testing.assert_frame_equal(read_back, data)  # same values, columns and dtypes
+
+
+# --- idempotency: file hash claims ---------------------------------------------------
+
+
+def test_first_claim_wins_and_second_gets_the_owner(table) -> None:
+    repository = DynamoDbDatasetRepository(TABLE)
+
+    assert repository.claim_file_hash("f" * 64, "ds-1") is None
+    assert repository.claim_file_hash("f" * 64, "ds-2") == "ds-1"
+
+    item = table.get_item(Key={"PK": "HASH#" + "f" * 64, "SK": "HASH"})["Item"]
+    assert item == {"PK": "HASH#" + "f" * 64, "SK": "HASH", "dataset_id": "ds-1"}
+
+
+def test_claiming_again_with_the_same_id_returns_that_id(table) -> None:
+    """A retry of the same upload sees its own claim, which the use case treats as a retry."""
+    repository = DynamoDbDatasetRepository(TABLE)
+    repository.claim_file_hash("e" * 64, "ds-1")
+
+    assert repository.claim_file_hash("e" * 64, "ds-1") == "ds-1"
+
+
+def test_different_hashes_do_not_collide(table) -> None:
+    repository = DynamoDbDatasetRepository(TABLE)
+
+    assert repository.claim_file_hash("1" * 64, "ds-1") is None
+    assert repository.claim_file_hash("2" * 64, "ds-2") is None
+
+
+def test_hash_items_stay_out_of_the_dataset_listing(table) -> None:
+    repository = DynamoDbDatasetRepository(TABLE)
+    repository.save_meta(make_meta("ds-1"))
+    repository.claim_file_hash("d" * 64, "ds-1")
+
+    listing = table.query(IndexName="GSI1", KeyConditionExpression=Key("GSI1PK").eq("DATASETS"))
+    assert [item["dataset_id"] for item in listing["Items"]] == ["ds-1"]
+
+
+# --- re-processing: deleting stats ---------------------------------------------------
+
+
+def test_delete_stats_removes_only_stats_items(table) -> None:
+    repository = DynamoDbDatasetRepository(TABLE)
+    repository.save_meta(make_meta("ds-1"))
+    repository.save_stats("ds-1", make_stats())
+    repository.save_meta(make_meta("ds-2"))
+    repository.save_stats("ds-2", make_stats())
+
+    repository.delete_stats("ds-1")
+
+    ds1 = table.query(KeyConditionExpression=Key("PK").eq("DATASET#ds-1"))["Items"]
+    ds2 = table.query(KeyConditionExpression=Key("PK").eq("DATASET#ds-2"))["Items"]
+    assert [item["SK"] for item in ds1] == ["META"]
+    assert len(ds2) == 4  # META + STATS#OVERALL + 2 subject/term items
+
+
+def test_delete_stats_handles_more_than_one_batch(table) -> None:
+    base = make_stats()
+    groups = tuple(SubjectTermStats(f"Subject {i:02d}", "T1", base.overall) for i in range(60))
+    stats = DatasetStats(
+        overall=base.overall,
+        student_count=base.student_count,
+        by_subject_term=groups,
+        top_students=base.top_students,
+        bottom_students=base.bottom_students,
+        class_averages=base.class_averages,
+    )
+    repository = DynamoDbDatasetRepository(TABLE)
+    repository.save_stats("ds-1", stats)
+
+    repository.delete_stats("ds-1")
+
+    assert table.query(KeyConditionExpression=Key("PK").eq("DATASET#ds-1"))["Count"] == 0
+
+
+def test_delete_stats_for_unknown_dataset_is_a_no_op(table) -> None:
+    DynamoDbDatasetRepository(TABLE).delete_stats("nope")
+
+
+# --- S3 quarantine -------------------------------------------------------------------
+
+
+def test_quarantine_copies_the_file_and_keeps_the_original() -> None:
+    s3 = boto3.client("s3")
+    for bucket in ("raw", "quarantine"):
+        s3.create_bucket(Bucket=bucket, CreateBucketConfiguration={"LocationConstraint": REGION})
+    s3.put_object(Bucket="raw", Key="uploads/ds-1/broken.csv", Body=b"student_id,score\n")
+
+    key = S3Quarantine("quarantine").quarantine("raw", "uploads/ds-1/broken.csv", "ds-1")
+
+    assert key == "quarantine/ds-1/broken.csv"
+    copied = s3.get_object(Bucket="quarantine", Key=key)["Body"].read()
+    assert copied == b"student_id,score\n"
+    assert s3.get_object(Bucket="raw", Key="uploads/ds-1/broken.csv")["Body"].read() == copied
+
+
+def test_quarantine_missing_source_raises() -> None:
+    s3 = boto3.client("s3")
+    for bucket in ("raw", "quarantine"):
+        s3.create_bucket(Bucket=bucket, CreateBucketConfiguration={"LocationConstraint": REGION})
+
+    with pytest.raises(s3.exceptions.NoSuchKey):
+        S3Quarantine("quarantine").quarantine("raw", "uploads/ds-1/missing.csv", "ds-1")
