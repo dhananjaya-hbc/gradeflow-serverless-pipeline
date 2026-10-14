@@ -11,6 +11,7 @@ class DatasetStatus(StrEnum):
     PROCESSING = "PROCESSING"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
+    DUPLICATE = "DUPLICATE"  # same file content as an earlier dataset; skipped, not processed
 
 
 @dataclass(frozen=True)
@@ -28,4 +29,7 @@ class DatasetMeta:
     clean_rows: int = 0  # rows left after cleaning (valid rows minus duplicates)
     duplicates_removed: int = 0
     processed_key: str | None = None  # where the cleaned Parquet file was written
+    file_hash: str | None = None  # SHA-256 of the uploaded file (idempotency key)
+    duplicate_of: str | None = None  # dataset_id that first uploaded identical content
+    quarantine_key: str | None = None  # where a rejected file was copied
     error_message: str | None = None
