@@ -2,8 +2,9 @@ AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
 Description: >
   GradeFlow - serverless data pipeline for education analytics.
-  Phase 3: S3 upload -> SQS (+DLQ) -> process Lambda (validate, clean, stats; skips duplicate
-  files, quarantines broken ones) -> Parquet in S3 + DynamoDB.
+  Phase 4: S3 upload -> SQS (+DLQ) -> trigger Lambda (skips duplicates) -> Step Functions
+  (validate, clean, stats, store; failure branch quarantines, records FAILED and alerts)
+  -> Parquet in S3 + DynamoDB.
 
 Parameters:
   MinValidRatio:
@@ -25,6 +26,17 @@ Parameters:
     # https://aws-sdk-pandas.readthedocs.io/en/stable/layers.html
     Default: arn:aws:lambda:ap-south-1:336392948345:layer:AWSSDKPandas-Python312-Arm64:31
     Description: ARN of the AWS SDK for pandas managed Lambda layer.
+  AlertEmail:
+    Type: String
+    Default: ""
+    AllowedPattern: '^$|^[^@\s]+@[^@\s]+$'
+    ConstraintDescription: Leave empty (no email) or give a valid address.
+    Description: >
+      Email address for failure alerts. Empty = the alert topic exists but nobody is
+      subscribed. AWS sends a confirmation link you must click once.
+
+Conditions:
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
 
 Globals:
   Function:
@@ -33,6 +45,8 @@ Globals:
     MemorySize: 256
     Timeout: 60
     CodeUri: src/ # every zip Lambda shares the gradeflow package
+    Layers:
+      - !Ref PandasLayerArn # gradeflow.application imports pandas, so every function needs it
 
 Resources:
   # --- Storage ---------------------------------------------------------------------
@@ -74,7 +88,8 @@ Resources:
   ProcessedBucket:
     Type: AWS::S3::Bucket
     Properties:
-      # Cleaned Parquet output: processed/<dataset_id>/data.parquet. Kept (no expiry).
+      # Cleaned Parquet output (processed/<dataset_id>/data.parquet) is kept. The work/ files
+      # that hand valid rows from Validate to Clean are temporary and expire.
       BucketName: !Sub "${AWS::StackName}-processed-${AWS::AccountId}-${AWS::Region}"
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
@@ -85,6 +100,12 @@ Resources:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
               SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteWorkFilesAfter7Days
+            Status: Enabled
+            Prefix: work/
+            ExpirationInDays: 7
 
   QuarantineBucket:
     Type: AWS::S3::Bucket
@@ -137,9 +158,8 @@ Resources:
   UploadQueue:
     Type: AWS::SQS::Queue
     Properties:
-      # AWS recommends at least 6x the consumer's timeout (120 s) so a slow run is not
-      # delivered to a second Lambda while still processing.
-      VisibilityTimeout: 720
+      # AWS recommends at least 6x the consumer's timeout (the trigger Lambda: 30 s).
+      VisibilityTimeout: 180
       SqsManagedSseEnabled: true
       RedrivePolicy:
         deadLetterTargetArn: !GetAtt DeadLetterQueue.Arn
@@ -167,44 +187,70 @@ Resources:
               StringEquals:
                 aws:SourceAccount: !Ref AWS::AccountId
 
-  # --- Processing ------------------------------------------------------------------
+  # --- Alerts ----------------------------------------------------------------------
 
-  ProcessFunction:
+  AlertTopic:
+    Type: AWS::SNS::Topic
+
+  AlertEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # --- Workflow --------------------------------------------------------------------
+
+  PipelineStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Type: STANDARD # keeps a visual per-step history in the console
+      DefinitionUri: statemachine/pipeline.asl.json
+      DefinitionSubstitutions:
+        ValidateFunctionArn: !GetAtt ValidateFunction.Arn
+        CleanFunctionArn: !GetAtt CleanFunction.Arn
+        StatsFunctionArn: !GetAtt StatsFunction.Arn
+        StoreFunctionArn: !GetAtt StoreFunction.Arn
+        FailFunctionArn: !GetAtt FailFunction.Arn
+        AlertTopicArn: !Ref AlertTopic
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref ValidateFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref CleanFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref StatsFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref StoreFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref FailFunction
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt AlertTopic.TopicName
+
+  # --- Functions: one per step, each with only the permissions its step needs -------
+
+  TriggerFunction:
     Type: AWS::Serverless::Function
     Properties:
-      Description: Validates, cleans and summarises uploaded datasets (one SQS message at a time).
-      Handler: gradeflow.entrypoints.process_handler.handler
-      MemorySize: 512 # pandas needs more memory; more memory also means more CPU
-      Timeout: 120
-      Layers:
-        - !Ref PandasLayerArn
+      Description: Reads each upload from SQS, skips duplicate files, starts the workflow.
+      Handler: gradeflow.entrypoints.trigger_handler.handler
+      Timeout: 30
       Environment:
         Variables:
           TABLE_NAME: !Ref PipelineTable
-          PROCESSED_BUCKET: !Ref ProcessedBucket
-          QUARANTINE_BUCKET: !Ref QuarantineBucket
-          MIN_VALID_RATIO: !Ref MinValidRatio
-          PASS_MARK: !Ref PassMark
+          STATE_MACHINE_ARN: !Ref PipelineStateMachine
       Policies:
-        # Least privilege: read only the raw bucket, write only the processed and quarantine
-        # buckets, and only the DynamoDB actions the code uses, on this table only.
-        # (For the SQS event SAM also attaches the AWS-managed AWSLambdaSQSQueueExecutionRole,
-        # which covers every queue in the account: to be tightened in the Phase 8 IAM review.)
         - S3ReadPolicy:
             BucketName: !Ref RawBucket
-        - S3WritePolicy:
-            BucketName: !Ref ProcessedBucket
-        - S3WritePolicy:
-            BucketName: !Ref QuarantineBucket
         - Statement:
             - Effect: Allow
               Action:
-                - dynamodb:PutItem # META, hash claim (conditional put)
+                - dynamodb:PutItem # hash claim, DUPLICATE and PROCESSING META
                 - dynamodb:GetItem # read the owner of a claimed hash
-                - dynamodb:Query # find STATS# items to delete
-                - dynamodb:DeleteItem # delete old STATS# items
-                - dynamodb:BatchWriteItem # batch_writer for stats puts and deletes
               Resource: !GetAtt PipelineTable.Arn
+        - StepFunctionsExecutionPolicy:
+            StateMachineName: !GetAtt PipelineStateMachine.Name
       Events:
         UploadedFile:
           Type: SQS
@@ -212,11 +258,123 @@ Resources:
             Queue: !GetAtt UploadQueue.Arn
             BatchSize: 1 # one upload per call, so a failure retries exactly that upload
 
-  ProcessFunctionLogGroup:
+  ValidateFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Workflow step 1, parses and validates the file, saves the valid rows.
+      Handler: gradeflow.entrypoints.validate_handler.handler
+      MemorySize: 512 # the whole file is parsed into memory
+      Timeout: 120
+      Environment:
+        Variables:
+          PROCESSED_BUCKET: !Ref ProcessedBucket
+          MIN_VALID_RATIO: !Ref MinValidRatio
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref RawBucket
+        - S3WritePolicy:
+            BucketName: !Ref ProcessedBucket
+
+  CleanFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Workflow step 2, cleans the valid rows and writes the Parquet file.
+      Handler: gradeflow.entrypoints.clean_handler.handler
+      MemorySize: 512 # pandas
+      Timeout: 120
+      Environment:
+        Variables:
+          PROCESSED_BUCKET: !Ref ProcessedBucket
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref ProcessedBucket
+        - S3WritePolicy:
+            BucketName: !Ref ProcessedBucket
+
+  StatsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Workflow step 3, computes statistics from the cleaned data.
+      Handler: gradeflow.entrypoints.stats_handler.handler
+      MemorySize: 512 # pandas
+      Timeout: 120
+      Environment:
+        Variables:
+          PROCESSED_BUCKET: !Ref ProcessedBucket
+          PASS_MARK: !Ref PassMark
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref ProcessedBucket
+
+  StoreFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Workflow step 4, saves statistics and marks the dataset COMPLETED.
+      Handler: gradeflow.entrypoints.store_handler.handler
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref PipelineTable
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:PutItem # META
+                - dynamodb:Query # find the old STATS# items
+                - dynamodb:DeleteItem # delete the old STATS# items
+                - dynamodb:BatchWriteItem # batch_writer for stats puts and deletes
+              Resource: !GetAtt PipelineTable.Arn
+
+  FailFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Failure branch, quarantines a bad file and marks the dataset FAILED.
+      Handler: gradeflow.entrypoints.fail_handler.handler
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref PipelineTable
+          QUARANTINE_BUCKET: !Ref QuarantineBucket
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref RawBucket # the copy reads the original
+        - S3WritePolicy:
+            BucketName: !Ref QuarantineBucket
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:PutItem # META
+              Resource: !GetAtt PipelineTable.Arn
+
+  # Log groups with a retention (the default is "never expire", which slowly costs money).
+  TriggerFunctionLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
-      LogGroupName: !Sub "/aws/lambda/${ProcessFunction}"
-      RetentionInDays: 14 # default is "never expire", which slowly costs money
+      LogGroupName: !Sub "/aws/lambda/${TriggerFunction}"
+      RetentionInDays: 14
+  ValidateFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ValidateFunction}"
+      RetentionInDays: 14
+  CleanFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${CleanFunction}"
+      RetentionInDays: 14
+  StatsFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${StatsFunction}"
+      RetentionInDays: 14
+  StoreFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${StoreFunction}"
+      RetentionInDays: 14
+  FailFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${FailFunction}"
+      RetentionInDays: 14
 
 Outputs:
   RawBucketName:
@@ -237,6 +395,12 @@ Outputs:
   PipelineTableName:
     Description: DynamoDB table with dataset metadata and statistics
     Value: !Ref PipelineTable
-  ProcessFunctionName:
-    Description: Process Lambda (check its logs in CloudWatch)
-    Value: !Ref ProcessFunction
+  PipelineStateMachineArn:
+    Description: The workflow; open it in the Step Functions console to see each run
+    Value: !Ref PipelineStateMachine
+  AlertTopicArn:
+    Description: Failure alerts are published here
+    Value: !Ref AlertTopic
+  TriggerFunctionName:
+    Description: Trigger Lambda (reads the queue; check its logs in CloudWatch)
+    Value: !Ref TriggerFunction
