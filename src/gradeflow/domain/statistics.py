@@ -3,7 +3,8 @@
 Pure pandas. All numbers are rounded to 2 decimals; pass_rate is a percentage (0-100).
 """
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from typing import Any
 
 import pandas as pd
 
@@ -47,6 +48,36 @@ class DatasetStats:
     top_students: tuple[StudentAverage, ...]  # best average first
     bottom_students: tuple[StudentAverage, ...]  # worst average first
     class_averages: dict[str, float]  # class -> mean of all its scores
+
+
+def stats_to_dict(stats: DatasetStats) -> dict[str, Any]:
+    """Convert stats to plain JSON types (dicts, lists, numbers) to pass between steps."""
+    return {
+        "overall": asdict(stats.overall),
+        "student_count": stats.student_count,
+        "by_subject_term": [
+            {"subject": group.subject, "term": group.term, "summary": asdict(group.summary)}
+            for group in stats.by_subject_term
+        ],
+        "top_students": [asdict(student) for student in stats.top_students],
+        "bottom_students": [asdict(student) for student in stats.bottom_students],
+        "class_averages": dict(stats.class_averages),
+    }
+
+
+def stats_from_dict(data: dict[str, Any]) -> DatasetStats:
+    """Inverse of stats_to_dict."""
+    return DatasetStats(
+        overall=ScoreSummary(**data["overall"]),
+        student_count=data["student_count"],
+        by_subject_term=tuple(
+            SubjectTermStats(group["subject"], group["term"], ScoreSummary(**group["summary"]))
+            for group in data["by_subject_term"]
+        ),
+        top_students=tuple(StudentAverage(**student) for student in data["top_students"]),
+        bottom_students=tuple(StudentAverage(**student) for student in data["bottom_students"]),
+        class_averages=dict(data["class_averages"]),
+    )
 
 
 def summarize_scores(scores: pd.Series, pass_mark: float) -> ScoreSummary:
