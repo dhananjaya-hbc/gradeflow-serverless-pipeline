@@ -31,6 +31,10 @@ class DynamoDbDatasetRepository:
         """Write (or overwrite) the DATASET#<id> / META item."""
         self._table.put_item(Item=to_meta_item(meta))
 
+    def create_meta_if_absent(self, meta: DatasetMeta) -> bool:
+        """Write the META item only if the dataset has none yet. True if it was created."""
+        return self._put_if_absent(to_meta_item(meta))
+
     def save_stats(self, dataset_id: str, stats: DatasetStats) -> None:
         """Write the STATS#OVERALL item and one STATS#SUBJECT#<subject>#<term> item per group.
 
@@ -64,16 +68,19 @@ class DynamoDbDatasetRepository:
         the same file are processed at the same moment.
         """
         key = {"PK": hash_pk(sha256), "SK": "HASH"}
+        if self._put_if_absent({**key, "dataset_id": dataset_id}):
+            return None
+        return self._table.get_item(Key=key, ConsistentRead=True)["Item"]["dataset_id"]
+
+    def _put_if_absent(self, item: dict[str, Any]) -> bool:
+        """Conditional put: True if written, False if an item with that key already exists."""
         try:
-            self._table.put_item(
-                Item={**key, "dataset_id": dataset_id},
-                ConditionExpression="attribute_not_exists(PK)",
-            )
+            self._table.put_item(Item=item, ConditionExpression="attribute_not_exists(PK)")
         except ClientError as exc:
             if exc.response["Error"]["Code"] != "ConditionalCheckFailedException":
                 raise
-            return self._table.get_item(Key=key, ConsistentRead=True)["Item"]["dataset_id"]
-        return None
+            return False
+        return True
 
 
 def to_meta_item(meta: DatasetMeta) -> dict[str, Any]:
