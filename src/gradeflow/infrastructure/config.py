@@ -54,8 +54,8 @@ class AnomaliesConfig:
 @dataclass(frozen=True)
 class StoreConfig:
     table_name: str
-    processed_bucket: str | None = None  # where the anomalies file is read from
-    max_anomalies: int = DEFAULT_MAX_ANOMALIES
+    processed_bucket: str  # where the anomalies file is read from
+    max_anomalies: int
 
 
 @dataclass(frozen=True)
@@ -106,7 +106,7 @@ def load_store_config(env: Mapping[str, str] | None = None) -> StoreConfig:
     env = _env(env)
     return StoreConfig(
         table_name=_required(env, "TABLE_NAME"),
-        processed_bucket=env.get("PROCESSED_BUCKET", "").strip() or None,
+        processed_bucket=_required(env, "PROCESSED_BUCKET"),
         max_anomalies=_integer(env, "MAX_ANOMALIES", DEFAULT_MAX_ANOMALIES, 1, 10_000),
     )
 
