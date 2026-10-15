@@ -9,21 +9,37 @@
       "ResultPath": "$.validation",
       "Retry": [
         {
-          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException", "States.TaskFailed"],
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException",
+            "States.TaskFailed"
+          ],
           "IntervalSeconds": 2,
           "MaxAttempts": 3,
           "BackoffRate": 2.0
         }
       ],
       "Catch": [
-        { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed" }
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "MarkFailed"
+        }
       ],
       "Next": "IsValid"
     },
     "IsValid": {
       "Type": "Choice",
       "Choices": [
-        { "Variable": "$.validation.valid", "BooleanEquals": true, "Next": "Clean" }
+        {
+          "Variable": "$.validation.valid",
+          "BooleanEquals": true,
+          "Next": "Clean"
+        }
       ],
       "Default": "MarkFailed"
     },
@@ -33,14 +49,26 @@
       "ResultPath": "$.cleaning",
       "Retry": [
         {
-          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException", "States.TaskFailed"],
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException",
+            "States.TaskFailed"
+          ],
           "IntervalSeconds": 2,
           "MaxAttempts": 3,
           "BackoffRate": 2.0
         }
       ],
       "Catch": [
-        { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed" }
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "MarkFailed"
+        }
       ],
       "Next": "Stats"
     },
@@ -50,14 +78,56 @@
       "ResultPath": "$.stats",
       "Retry": [
         {
-          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException", "States.TaskFailed"],
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException",
+            "States.TaskFailed"
+          ],
           "IntervalSeconds": 2,
           "MaxAttempts": 3,
           "BackoffRate": 2.0
         }
       ],
       "Catch": [
-        { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed" }
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "MarkFailed"
+        }
+      ],
+      "Next": "Anomalies"
+    },
+    "Anomalies": {
+      "Type": "Task",
+      "Comment": "Container-image Lambda: rule-based detectors plus an Isolation Forest. Findings go to S3.",
+      "Resource": "${AnomaliesFunctionArn}",
+      "ResultPath": "$.anomalies",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException",
+            "States.TaskFailed"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "MarkFailed"
+        }
       ],
       "Next": "Store"
     },
@@ -67,14 +137,26 @@
       "ResultPath": "$.result",
       "Retry": [
         {
-          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException", "States.TaskFailed"],
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException",
+            "States.TaskFailed"
+          ],
           "IntervalSeconds": 2,
           "MaxAttempts": 3,
           "BackoffRate": 2.0
         }
       ],
       "Catch": [
-        { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed" }
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "MarkFailed"
+        }
       ],
       "End": true
     },
@@ -85,21 +167,35 @@
       "ResultPath": "$.failure",
       "Retry": [
         {
-          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException", "States.TaskFailed"],
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException",
+            "States.TaskFailed"
+          ],
           "IntervalSeconds": 2,
           "MaxAttempts": 3,
           "BackoffRate": 2.0
         }
       ],
       "Catch": [
-        { "ErrorEquals": ["States.ALL"], "ResultPath": "$.failure_error", "Next": "FailureNotRecorded" }
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.failure_error",
+          "Next": "FailureNotRecorded"
+        }
       ],
       "Next": "NotifyFailure"
     },
     "FailureNotRecorded": {
       "Type": "Pass",
       "Comment": "Recording the failure failed too. Still alert, with a message NotifyFailure can rely on.",
-      "Result": { "error_message": "the failure could not be recorded in DynamoDB; see this execution" },
+      "Result": {
+        "error_message": "the failure could not be recorded in DynamoDB; see this execution"
+      },
       "ResultPath": "$.failure",
       "Next": "NotifyFailure"
     },
@@ -113,7 +209,13 @@
       },
       "ResultPath": null,
       "Catch": [
-        { "ErrorEquals": ["States.ALL"], "ResultPath": null, "Next": "PipelineFailed" }
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": null,
+          "Next": "PipelineFailed"
+        }
       ],
       "Next": "PipelineFailed"
     },
