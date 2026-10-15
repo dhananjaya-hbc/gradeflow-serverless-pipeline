@@ -3,12 +3,14 @@
 import pytest
 
 from gradeflow.infrastructure.config import (
+    AnomaliesConfig,
     ConfigError,
     RejectConfig,
     StatsConfig,
     StoreConfig,
     TriggerConfig,
     ValidateConfig,
+    load_anomalies_config,
     load_clean_config,
     load_reject_config,
     load_stats_config,
@@ -81,3 +83,50 @@ def test_invalid_ratio(ratio: str) -> None:
 def test_invalid_pass_mark(mark: str) -> None:
     with pytest.raises(ConfigError, match="PASS_MARK"):
         load_stats_config({"PROCESSED_BUCKET": "p", "PASS_MARK": mark})
+
+
+# --- anomalies ----------------------------------------------------------------------
+
+
+def test_anomalies_config_values_and_defaults() -> None:
+    assert load_anomalies_config({"PROCESSED_BUCKET": "p"}) == AnomaliesConfig("p", 3.0, 30.0, 0.05)
+    custom = {
+        "PROCESSED_BUCKET": "p",
+        "ZSCORE_LIMIT": "2.5",
+        "JUMP_THRESHOLD": "40",
+        "IF_CONTAMINATION": "0.1",
+    }
+    assert load_anomalies_config(custom) == AnomaliesConfig("p", 2.5, 40.0, 0.1)
+
+
+def test_anomalies_config_needs_the_processed_bucket() -> None:
+    with pytest.raises(ConfigError, match="PROCESSED_BUCKET"):
+        load_anomalies_config({})
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("ZSCORE_LIMIT", "0.1"), ("ZSCORE_LIMIT", "50"), ("ZSCORE_LIMIT", "abc"),
+        ("JUMP_THRESHOLD", "0"), ("JUMP_THRESHOLD", "150"), ("JUMP_THRESHOLD", "abc"),
+        ("IF_CONTAMINATION", "0"), ("IF_CONTAMINATION", "0.6"), ("IF_CONTAMINATION", "abc"),
+    ],
+)  # fmt: skip
+def test_anomalies_config_rejects_values_that_make_no_sense(name: str, value: str) -> None:
+    with pytest.raises(ConfigError, match=name):
+        load_anomalies_config({"PROCESSED_BUCKET": "p", name: value})
+
+
+def test_store_config_reads_the_anomaly_settings() -> None:
+    config = load_store_config({"TABLE_NAME": "T", "PROCESSED_BUCKET": "p", "MAX_ANOMALIES": "200"})
+    assert config == StoreConfig("T", "p", 200)
+
+
+def test_store_config_defaults_to_500_anomalies() -> None:
+    assert load_store_config({"TABLE_NAME": "T"}).max_anomalies == 500
+
+
+@pytest.mark.parametrize("value", ["0", "10001", "abc", "1.5", "-3"])
+def test_store_config_rejects_a_bad_anomaly_cap(value: str) -> None:
+    with pytest.raises(ConfigError, match="MAX_ANOMALIES"):
+        load_store_config({"TABLE_NAME": "T", "MAX_ANOMALIES": value})
