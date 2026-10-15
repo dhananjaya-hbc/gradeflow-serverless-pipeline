@@ -2,6 +2,7 @@
 
 Both kinds live in the processed bucket:
 - work/<dataset_id>/valid.jsonl      validated rows, one JSON object per line (temporary)
+- work/<dataset_id>/anomalies.jsonl  every anomaly found, ranked, one JSON object per line
 - processed/<dataset_id>/data.parquet  the final cleaned data
 """
 
@@ -12,11 +13,16 @@ from typing import Any
 import boto3
 import pandas as pd
 
+from gradeflow.domain.anomalies import Anomaly
 from gradeflow.domain.validation import Row
 
 
 def valid_rows_key(dataset_id: str) -> str:
     return f"work/{dataset_id}/valid.jsonl"
+
+
+def anomalies_key(dataset_id: str) -> str:
+    return f"work/{dataset_id}/anomalies.jsonl"
 
 
 def clean_data_key(dataset_id: str) -> str:
@@ -51,6 +57,17 @@ class S3DatasetArtifacts:
 
     def load_clean_data(self, key: str) -> pd.DataFrame:
         return pd.read_parquet(io.BytesIO(self._get(key)))
+
+    def save_anomalies(self, dataset_id: str, anomalies: list[Anomaly]) -> str:
+        """Write all findings in the given (ranked) order, one JSON object per line."""
+        body = "".join(json.dumps(a.to_dict(), ensure_ascii=False) + "\n" for a in anomalies)
+        key = anomalies_key(dataset_id)
+        self._put(key, body.encode("utf-8"), "application/x-ndjson")
+        return key
+
+    def load_anomalies(self, key: str) -> list[Anomaly]:
+        text = self._get(key).decode("utf-8")
+        return [Anomaly.from_dict(json.loads(line)) for line in text.splitlines() if line.strip()]
 
     def _put(self, key: str, body: bytes, content_type: str) -> None:
         self._client.put_object(Bucket=self._bucket, Key=key, Body=body, ContentType=content_type)
