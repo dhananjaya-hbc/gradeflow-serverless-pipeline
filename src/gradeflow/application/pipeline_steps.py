@@ -10,7 +10,12 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import StrEnum
 
-from gradeflow.application.pipeline_state import CleaningOutcome, PipelineState, ValidationOutcome
+from gradeflow.application.pipeline_state import (
+    CleaningOutcome,
+    PipelineState,
+    ValidationOutcome,
+    require,
+)
 from gradeflow.application.ports import (
     DatasetArtifacts,
     DatasetRepository,
@@ -25,6 +30,7 @@ from gradeflow.domain.statistics import compute_stats, stats_from_dict, stats_to
 from gradeflow.domain.validation import FileValidationError, parse_rows, split_valid_rows
 
 MAX_ERROR_MESSAGE = 500  # keep crash messages from Step Functions small
+DEFAULT_MAX_ANOMALIES = 500  # ANOMALY# records stored per dataset
 _EXECUTION_NAME_UNSAFE = re.compile(r"[^A-Za-z0-9_-]")
 
 
@@ -156,9 +162,9 @@ class CleanStep:
         self._artifacts = artifacts
 
     def execute(self, state: PipelineState) -> CleaningOutcome:
-        validation = _require(state.validation, "validation")
+        validation = require(state.validation, "validation")
         rows = self._artifacts.load_valid_rows(
-            _require(validation.valid_key, "validation.valid_key")
+            require(validation.valid_key, "validation.valid_key")
         )
         cleaned = clean_rows(rows)
         processed_key = self._artifacts.save_clean_data(state.dataset_id, cleaned.data)
@@ -180,7 +186,7 @@ class StatsStep:
         self._pass_mark = pass_mark
 
     def execute(self, state: PipelineState) -> dict:
-        cleaning = _require(state.cleaning, "cleaning")
+        cleaning = require(state.cleaning, "cleaning")
         data = self._artifacts.load_clean_data(cleaning.processed_key)
         return stats_to_dict(compute_stats(data, self._pass_mark))
 
@@ -189,18 +195,31 @@ class StatsStep:
 
 
 class StoreStep:
-    """Write the statistics, then mark the dataset COMPLETED (last, so it means "all there")."""
+    """Write statistics and anomalies, then mark the dataset COMPLETED (last, so it means
+    "everything is there").
 
-    def __init__(self, repository: DatasetRepository) -> None:
+    Only the `max_anomalies` most important findings become ANOMALY# records; META keeps the
+    true total, so nothing is hidden silently.
+    """
+
+    def __init__(
+        self,
+        repository: DatasetRepository,
+        artifacts: DatasetArtifacts | None = None,
+        max_anomalies: int = DEFAULT_MAX_ANOMALIES,
+    ) -> None:
         self._repository = repository
+        self._artifacts = artifacts
+        self._max_anomalies = max_anomalies
 
     def execute(self, state: PipelineState) -> DatasetMeta:
-        validation = _require(state.validation, "validation")
-        cleaning = _require(state.cleaning, "cleaning")
-        stats = _require(state.stats, "stats")
-        # Re-processing an ID must not leave stats of an earlier upload behind.
+        validation = require(state.validation, "validation")
+        cleaning = require(state.cleaning, "cleaning")
+        stats = require(state.stats, "stats")
+        # Re-processing an ID must not leave stats or anomalies of an earlier upload behind.
         self._repository.delete_stats(state.dataset_id)
         self._repository.save_stats(state.dataset_id, stats_from_dict(stats))
+        anomaly_count, stored, ml_skipped = self._store_anomalies(state)
         meta = DatasetMeta(
             dataset_id=state.dataset_id,
             filename=state.filename,
@@ -213,10 +232,25 @@ class StoreStep:
             clean_rows=cleaning.clean_rows,
             duplicates_removed=cleaning.duplicates_removed,
             processed_key=cleaning.processed_key,
+            anomaly_count=anomaly_count,
+            anomalies_stored=stored,
+            ml_skipped=ml_skipped,
             file_hash=state.file_hash,
         )
         self._repository.save_meta(meta)
         return meta
+
+    def _store_anomalies(self, state: PipelineState) -> tuple[int, int, str | None]:
+        """Returns (total found, how many stored, why the forest was skipped)."""
+        if state.anomalies is None:  # runs from before the Anomalies step existed
+            return 0, 0, None
+        if self._artifacts is None:
+            raise ValueError("StoreStep needs artifacts to read the anomalies")
+        found = self._artifacts.load_anomalies(state.anomalies.anomalies_key)
+        kept = found[: self._max_anomalies]  # already ranked, most important first
+        self._repository.delete_anomalies(state.dataset_id)
+        self._repository.save_anomalies(state.dataset_id, kept)
+        return len(found), len(kept), state.anomalies.ml_skipped
 
 
 # --- Reject (failure branch) ---------------------------------------------------------
@@ -254,15 +288,6 @@ class RejectDataset:
         )
         self._repository.save_meta(meta)
         return meta
-
-
-def _require[T](value: T | None, name: str) -> T:
-    """Return a state section, or fail loudly if the state machine did not provide it."""
-    if value is None:
-        raise ValueError(
-            f"pipeline state has no '{name}': the state machine passed the wrong input"
-        )
-    return value
 
 
 def _failure_message(state: PipelineState, validation: ValidationOutcome) -> str:
