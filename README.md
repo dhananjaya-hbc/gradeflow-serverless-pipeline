@@ -19,15 +19,15 @@ flowchart TD
     workflow -->|"Parquet"| processed[("S3 processed bucket")]
     workflow -->|"bad files"| quarantine[("S3 quarantine bucket")]
     workflow -->|"failure alert"| sns["SNS email alert"]
-    ddb -.-> api["API Gateway and Lambda<br/>Phase 6"]:::planned
+    ddb --> api["API Gateway and Lambda<br/>API key required"]
     api -.-> dashboard["React dashboard<br/>Phase 7"]:::planned
 
     classDef planned stroke-dasharray: 5 5,fill:#f4f4f4,color:#555
 ```
 
-Solid boxes are built and deployed (up to v0.5.0). Dashed boxes are planned in later phases.
+Solid boxes are built and deployed (up to v0.6.0). Dashed boxes are planned in later phases.
 
-## What works today (v0.5.0)
+## What works today (v0.6.0)
 
 ```mermaid
 flowchart TD
@@ -227,6 +227,46 @@ was real work. The step's 300-second timeout (and the state machine's retries) c
 The `joblib will operate in serial mode` warning in its logs is harmless: Lambda has no shared
 memory for it, so it runs single-threaded.
 
+### Analytics API
+
+A REST API (API Gateway + one Lambda) serves what the pipeline stores. It only **reads** (the
+Lambda has `GetItem` and `Query` on the table and nothing else) and signs upload forms. Every
+route needs the **`x-api-key`** header.
+
+| Method and path | Returns |
+|---|---|
+| `POST /uploads` | body `{"filename": "results.csv"}`: a **pre-signed S3 upload form** for a new dataset. The server picks the dataset id (`ds-<date>-<random>`), so nobody can upload under an existing id. Only `.csv` and `.json`. |
+| `GET /datasets` | datasets, **newest first**, with status and counts. `?limit=` (1 to 100, default 20) and `?cursor=` for the next page. |
+| `GET /datasets/{id}` | the record plus its validation report: row counts, row errors, error message, cleaning counts, anomaly counts. |
+| `GET /datasets/{id}/stats` | overall stats, per-subject and term stats, top and bottom students, class averages. Empty (not an error) while the dataset is unfinished or failed. |
+| `GET /datasets/{id}/anomalies` | findings in rank order. `?method=` (`term_jump`, `duplicate_id`, `zscore`, `isolation_forest`), `?limit=` (1 to 500, default 100) and `?cursor=`. |
+
+**Paging.** A page that has more after it carries `next_cursor`: pass it back as `?cursor=`. The last
+page has `next_cursor: null`, so a client stops there. A cursor is only a position and the dataset always
+comes from the URL, so a forged or borrowed cursor can never read another dataset.
+
+**Errors** always look the same: `{"error": {"code": "...", "message": "..."}}`.
+
+| Status | When |
+|---|---|
+| 400 | bad `limit`, `method`, `cursor`, dataset id, JSON body or filename (`invalid_limit`, `invalid_method`, `invalid_cursor`, `invalid_dataset_id`, `invalid_json`, `invalid_filename`, `unsupported_file_type`) |
+| 403 | no API key, a wrong key, or a route that does not exist (API Gateway's own `Forbidden` / `Missing Authentication Token`) |
+| 404 | unknown dataset |
+| 413 | request body over 4 KB |
+| 429 | too many requests (usage plan) |
+| 500 | something unexpected, or Lambda was at its concurrency limit (see Limits) |
+
+**Uploading through the API** takes two steps: ask for a signed form, then post the file straight to S3
+with it. S3 itself enforces what was signed: this one key, **1 byte to 50 MB**, valid for 15 minutes
+(an empty file is refused with `EntityTooSmall`). [scripts/api_upload.py](scripts/api_upload.py) does both
+steps. The upload then goes through the normal pipeline.
+
+**Security, honestly.** The API key is a gate against casual abuse and a way to rate-limit, **not real
+authentication**. A dashboard that ships the key in its JavaScript exposes it, and anyone who holds the key
+can read every dataset and start uploads. The usage plan limits damage (5 requests per second, burst 10, 5,000
+a day). The data is synthetic. Cognito is the later upgrade. CORS allows any origin (`AllowedOrigin=*`)
+until the dashboard has an address, and S3 will need its own CORS rule for browser uploads (Phase 7).
+
 ### DynamoDB items (table `PipelineTable`)
 
 | PK | SK | Content |
@@ -325,7 +365,8 @@ sam deploy                    # shows the change set, then asks for confirmation
 ```
 
 Optional parameters, e.g. `sam deploy --parameter-overrides MinValidRatio=0.9 PassMark=40 JumpThreshold=40 AlertEmail=you@example.com`.
-The anomaly settings are `ZScoreLimit`, `JumpThreshold`, `IfContamination` and `MaxAnomalies`.
+The anomaly settings are `ZScoreLimit`, `JumpThreshold`, `IfContamination` and `MaxAnomalies`;
+`AllowedOrigin` is the website allowed to call the API from a browser.
 
 The first `sam deploy` asks to create an **ECR repository** for the container image (answer `y`),
 then pushes it: about 320 MB compressed, so the first push takes several minutes. Later deploys only
@@ -451,8 +492,38 @@ anomalies demo-5
 Expect `COMPLETED`, 9 anomalies, steps `Validate IsValid Clean Stats Anomalies Store`, and the nine
 rows from the results table above, in that order.
 
+**7. The API.** Get the address and the key (the key is a secret: keep it in your shell, never in git):
+
+```bash
+export GRADEFLOW_API_URL=$(aws cloudformation describe-stacks --stack-name gradeflow --region ap-south-1 --query "Stacks[0].Outputs[?OutputKey=='ApiUrl'].OutputValue" --output text)
+KEYID=$(aws cloudformation describe-stacks --stack-name gradeflow --region ap-south-1 --query "Stacks[0].Outputs[?OutputKey=='ApiKeyId'].OutputValue" --output text)
+export GRADEFLOW_API_KEY=$(aws apigateway get-api-key --api-key $KEYID --include-value --region ap-south-1 --query value --output text)
+```
+
+```bash
+curl -s -H "x-api-key: $GRADEFLOW_API_KEY" "$GRADEFLOW_API_URL/datasets?limit=2" | python3 -m json.tool
+curl -s -H "x-api-key: $GRADEFLOW_API_KEY" "$GRADEFLOW_API_URL/datasets/demo-5" | python3 -m json.tool
+curl -s -H "x-api-key: $GRADEFLOW_API_KEY" "$GRADEFLOW_API_URL/datasets/demo-5/stats" | python3 -m json.tool
+curl -s -H "x-api-key: $GRADEFLOW_API_KEY" "$GRADEFLOW_API_URL/datasets/demo-5/anomalies?method=isolation_forest" | python3 -m json.tool
+curl -s "$GRADEFLOW_API_URL/datasets"
+curl -s -H "x-api-key: $GRADEFLOW_API_KEY" "$GRADEFLOW_API_URL/datasets/nope"
+```
+
+The last two show the errors: no key gives `{"message":"Forbidden"}`, an unknown dataset gives a 404 body.
+Upload a new file through the API, and prove S3 enforces the limits:
+
+```bash
+python scripts/generate_sample_data.py --seed 44 --out data/sample_api.csv
+python scripts/api_upload.py data/sample_api.csv
+: > /tmp/empty.csv
+python scripts/api_upload.py /tmp/empty.csv
+```
+
+Expect `uploaded : HTTP 204` for the first (the dataset appears at the top of `GET /datasets` and reaches
+`COMPLETED` within a minute) and `refused with HTTP 400 ... EntityTooSmall` for the empty file.
+
 Lambda logs: `sam logs -n ValidateFunction --stack-name gradeflow --region ap-south-1 --tail`
-(use `TriggerFunction`, `CleanFunction`, `StatsFunction`, `AnomaliesFunction`, `StoreFunction` or `FailFunction`).
+(use `TriggerFunction`, `CleanFunction`, `StatsFunction`, `AnomaliesFunction`, `StoreFunction`, `FailFunction` or `ApiFunction`).
 
 ### Clean up
 
@@ -476,6 +547,8 @@ At portfolio-demo volume this stays within the AWS Free Tier:
   the 25 MB test file used about 30 GB-seconds in total, against a free tier of 400,000
   GB-seconds a month (roughly 13,000 uploads of that size; typical small files use 1 or 2).
 - Step Functions: about 10 state transitions per run, against a free tier of 4,000 a month.
+- API Gateway (REST): the first 1 million calls a month are free for 12 months on a new account, then
+  about $3.50 per million. The usage plan also caps it at 5,000 calls a day.
 - DynamoDB is on-demand, so it costs nothing when idle.
 - Raw and quarantined files expire after 30 days, and the temporary `work/` files after 7.
 - SQS and SNS volumes are far inside their free tiers.
@@ -500,6 +573,17 @@ The **Anomalies** container (2048 MB, 300 s timeout) used 374 to 379 MB on 904-r
 been measured on the 25 MB file, so its large-file memory is an estimate (it loads the cleaned data
 as a DataFrame, as Stats does, plus the forest).
 
+**Lambda concurrency.** A new AWS account allows only **10 concurrent Lambda executions in total**
+(the normal default is 1,000), shared by every function. The API reads in about 300 ms, so a dashboard is
+fine, but **60 simultaneous requests** made most of them fail with a 500: Lambda refused to start more than
+10 at once (CloudWatch showed 52 throttles and no function errors) and API Gateway reports that as a generic
+500. The API usage plan (5 requests per second, burst 10) helps but is **best-effort, not a guarantee**: in
+that burst it still let about 50 of 60 requests through. Two things handle it in practice: a client should
+**retry 429 and 500 with a short backoff** (the Phase 7 dashboard will), and you can request a higher quota
+(free, may take days for a new account):
+`aws service-quotas request-service-quota-increase --service-code lambda --quota-code L-B99A9384 --desired-value 100`.
+The pipeline itself is protected: Step Functions retries a throttled Lambda three times, and SQS retries the trigger.
+
 Extrapolating the same figures, a 50 MB file (about a million rows) should need roughly 1.5 to
 1.6 GB in Clean, which fits in 2048 MB. **That size has not been run**: 25 MB is the largest file
 verified. Files much beyond 50 MB would need chunked processing, AWS Glue or Fargate, which are
@@ -513,7 +597,7 @@ out of scope for this project. Each Lambda also has a 15-minute ceiling (these u
 - [x] Phase 3: Reliability: SQS, DLQ, idempotency, quarantine (`v0.3.0`)
 - [x] Phase 4: Orchestration with Step Functions (`v0.4.0`)
 - [x] Phase 5: Anomaly detection, rule-based + Isolation Forest (`v0.5.0`)
-- [ ] Phase 6: Analytics API (`v0.6.0`)
+- [x] Phase 6: Analytics API (`v0.6.0`)
 - [ ] Phase 7: Dashboard (`v0.7.0`)
 - [ ] Phase 8: Observability & security (`v0.8.0`)
 - [ ] Phase 9: CI/CD & release (`v1.0.0`)
