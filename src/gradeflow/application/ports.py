@@ -8,6 +8,7 @@ from typing import Any, Protocol
 
 import pandas as pd
 
+from gradeflow.domain.anomalies import Anomaly
 from gradeflow.domain.dataset import DatasetMeta
 from gradeflow.domain.statistics import DatasetStats
 from gradeflow.domain.validation import Row
@@ -48,6 +49,14 @@ class DatasetArtifacts(Protocol):
         """Load data saved by save_clean_data."""
         ...
 
+    def save_anomalies(self, dataset_id: str, anomalies: list[Anomaly]) -> str:
+        """Store every finding of the Anomalies step (in order) and return the key."""
+        ...
+
+    def load_anomalies(self, key: str) -> list[Anomaly]:
+        """Load findings saved by save_anomalies, in the same order."""
+        ...
+
 
 class DatasetRepository(Protocol):
     """Persists dataset metadata, statistics and file-hash claims."""
@@ -66,6 +75,14 @@ class DatasetRepository(Protocol):
 
     def delete_stats(self, dataset_id: str) -> None:
         """Remove all statistics records of a dataset (before re-processing it)."""
+        ...
+
+    def save_anomalies(self, dataset_id: str, anomalies: list[Anomaly]) -> None:
+        """Write the findings as ANOMALY# records, numbered in the order given."""
+        ...
+
+    def delete_anomalies(self, dataset_id: str) -> None:
+        """Remove all anomaly records of a dataset (before re-processing it)."""
         ...
 
     def claim_file_hash(self, sha256: str, dataset_id: str) -> str | None:
