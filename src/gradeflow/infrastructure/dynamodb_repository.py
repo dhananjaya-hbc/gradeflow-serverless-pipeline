@@ -10,17 +10,7 @@ from botocore.exceptions import ClientError
 from gradeflow.domain.anomalies import Anomaly
 from gradeflow.domain.dataset import DatasetMeta
 from gradeflow.domain.statistics import DatasetStats, ScoreSummary, StudentAverage
-
-DATASETS_GSI_PK = "DATASETS"  # all datasets share this GSI1 partition -> list by upload time
-
-
-def dataset_pk(dataset_id: str) -> str:
-    return f"DATASET#{dataset_id}"
-
-
-def hash_pk(sha256: str) -> str:
-    return f"HASH#{sha256}"
-
+from gradeflow.infrastructure.table_keys import DATASETS_GSI_PK, dataset_pk, hash_pk
 
 MAX_ANOMALY_RECORDS = 99_999  # the numbering in the sort key has five digits
 
