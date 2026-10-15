@@ -10,6 +10,10 @@ from dataclasses import dataclass
 
 DEFAULT_MIN_VALID_RATIO = 0.8
 DEFAULT_PASS_MARK = 50.0
+DEFAULT_ZSCORE_LIMIT = 3.0
+DEFAULT_JUMP_THRESHOLD = 30.0
+DEFAULT_CONTAMINATION = 0.05
+DEFAULT_MAX_ANOMALIES = 500
 
 
 class ConfigError(Exception):
@@ -40,8 +44,18 @@ class StatsConfig:
 
 
 @dataclass(frozen=True)
+class AnomaliesConfig:
+    processed_bucket: str
+    zscore_limit: float
+    jump_threshold: float
+    contamination: float
+
+
+@dataclass(frozen=True)
 class StoreConfig:
     table_name: str
+    processed_bucket: str | None = None  # where the anomalies file is read from
+    max_anomalies: int = DEFAULT_MAX_ANOMALIES
 
 
 @dataclass(frozen=True)
@@ -78,8 +92,23 @@ def load_stats_config(env: Mapping[str, str] | None = None) -> StatsConfig:
     )
 
 
+def load_anomalies_config(env: Mapping[str, str] | None = None) -> AnomaliesConfig:
+    env = _env(env)
+    return AnomaliesConfig(
+        processed_bucket=_required(env, "PROCESSED_BUCKET"),
+        zscore_limit=_number(env, "ZSCORE_LIMIT", DEFAULT_ZSCORE_LIMIT, 0.5, 10.0),
+        jump_threshold=_number(env, "JUMP_THRESHOLD", DEFAULT_JUMP_THRESHOLD, 1.0, 100.0),
+        contamination=_number(env, "IF_CONTAMINATION", DEFAULT_CONTAMINATION, 0.001, 0.5),
+    )
+
+
 def load_store_config(env: Mapping[str, str] | None = None) -> StoreConfig:
-    return StoreConfig(table_name=_required(_env(env), "TABLE_NAME"))
+    env = _env(env)
+    return StoreConfig(
+        table_name=_required(env, "TABLE_NAME"),
+        processed_bucket=env.get("PROCESSED_BUCKET", "").strip() or None,
+        max_anomalies=_integer(env, "MAX_ANOMALIES", DEFAULT_MAX_ANOMALIES, 1, 10_000),
+    )
 
 
 def load_reject_config(env: Mapping[str, str] | None = None) -> RejectConfig:
@@ -109,4 +138,15 @@ def _number(env: Mapping[str, str], name: str, default: float, low: float, high:
         raise ConfigError(f"{name} must be a number, got '{raw}'") from exc
     if not low <= value <= high:
         raise ConfigError(f"{name} must be between {low:g} and {high:g}, got {value:g}")
+    return value
+
+
+def _integer(env: Mapping[str, str], name: str, default: int, low: int, high: int) -> int:
+    raw = env.get(name, str(default))
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ConfigError(f"{name} must be a whole number, got '{raw}'") from exc
+    if not low <= value <= high:
+        raise ConfigError(f"{name} must be between {low} and {high}, got {value}")
     return value
