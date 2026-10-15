@@ -25,10 +25,9 @@ def handler(event: dict[str, Any], context: object) -> dict[str, Any]:
 @cache
 def _build_step() -> StoreStep:
     config = load_store_config()
-    artifacts = S3DatasetArtifacts(config.processed_bucket) if config.processed_bucket else None
     return StoreStep(
         repository=DynamoDbDatasetRepository(config.table_name),
-        artifacts=artifacts,
+        artifacts=S3DatasetArtifacts(config.processed_bucket),
         max_anomalies=config.max_anomalies,
     )
 
