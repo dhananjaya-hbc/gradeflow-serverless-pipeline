@@ -29,6 +29,9 @@ class DatasetMeta:
     clean_rows: int = 0  # rows left after cleaning (valid rows minus duplicates)
     duplicates_removed: int = 0
     processed_key: str | None = None  # where the cleaned Parquet file was written
+    anomaly_count: int = 0  # every anomaly found (only the most important are stored)
+    anomalies_stored: int = 0  # how many ANOMALY# items were written
+    ml_skipped: str | None = None  # why the Isolation Forest did not run, if it did not
     file_hash: str | None = None  # SHA-256 of the uploaded file (idempotency key)
     duplicate_of: str | None = None  # dataset_id that first uploaded identical content
     quarantine_key: str | None = None  # where a rejected file was copied
