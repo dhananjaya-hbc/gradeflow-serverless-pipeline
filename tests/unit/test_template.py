@@ -7,12 +7,14 @@ permission that drifts from the design.
 
 import importlib
 import re
+import tomllib
 from pathlib import Path
 from typing import Any
 
 import pytest
 import yaml
 
+from gradeflow.domain import anomalies as anomaly_defaults
 from gradeflow.infrastructure import config
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -33,7 +35,8 @@ def _intrinsic(loader: yaml.Loader, suffix: str, node: yaml.Node) -> dict[str, A
 
 
 _TemplateLoader.add_multi_constructor("!", _intrinsic)
-RESOURCES: dict[str, dict[str, Any]] = yaml.load(TEMPLATE_TEXT, Loader=_TemplateLoader)["Resources"]
+TEMPLATE: dict[str, Any] = yaml.load(TEMPLATE_TEXT, Loader=_TemplateLoader)
+RESOURCES: dict[str, dict[str, Any]] = TEMPLATE["Resources"]
 FUNCTIONS = {
     name: resource["Properties"]
     for name, resource in RESOURCES.items()
@@ -46,6 +49,7 @@ LOADERS = {
     "ValidateFunction": config.load_validate_config,
     "CleanFunction": config.load_clean_config,
     "StatsFunction": config.load_stats_config,
+    "AnomaliesFunction": config.load_anomalies_config,
     "StoreFunction": config.load_store_config,
     "FailFunction": config.load_reject_config,
 }
@@ -56,19 +60,35 @@ def test_every_function_has_a_config_loader_in_this_test() -> None:
     assert set(FUNCTIONS) == set(LOADERS)
 
 
+def handler_path(name: str) -> str:
+    """Zip functions name their handler; image functions name it in ImageConfig.Command."""
+    properties = FUNCTIONS[name]
+    return (
+        properties["Handler"]
+        if "Handler" in properties
+        else properties["ImageConfig"]["Command"][0]
+    )
+
+
 @pytest.mark.parametrize("name", sorted(FUNCTIONS))
 def test_handler_path_points_at_a_real_handler(name: str) -> None:
-    handler_path = FUNCTIONS[name]["Handler"]
-    module_name, _, function_name = handler_path.rpartition(".")
+    module_name, _, function_name = handler_path(name).rpartition(".")
     module = importlib.import_module(module_name)
-    assert callable(getattr(module, function_name)), f"{handler_path} is not a function"
+    assert callable(getattr(module, function_name)), f"{handler_path(name)} is not a function"
 
 
 @pytest.mark.parametrize("name", sorted(FUNCTIONS))
 def test_template_provides_every_env_var_the_handler_needs(name: str) -> None:
     """The loader reads exactly what this function is configured with (or raises)."""
     names = set(FUNCTIONS[name].get("Environment", {}).get("Variables", {}))
-    dummy = {"MIN_VALID_RATIO": "0.8", "PASS_MARK": "50"}
+    dummy = {  # numeric settings need a valid number, the rest just need to be non-empty
+        "MIN_VALID_RATIO": "0.8",
+        "PASS_MARK": "50",
+        "ZSCORE_LIMIT": "3",
+        "JUMP_THRESHOLD": "30",
+        "IF_CONTAMINATION": "0.05",
+        "MAX_ANOMALIES": "500",
+    }
     env = {variable: dummy.get(variable, "x") for variable in names}
 
     LOADERS[name](env)  # raises ConfigError if the template forgot a variable
@@ -111,7 +131,12 @@ def dynamodb_actions(name: str) -> set[str]:
     actions: set[str] = set()
     for policy in FUNCTIONS[name]["Policies"]:
         for statement in policy.get("Statement", []):
-            actions.update(a for a in statement["Action"] if a.startswith("dynamodb:"))
+            action = statement["Action"]
+            actions.update(
+                a
+                for a in ([action] if isinstance(action, str) else action)
+                if a.startswith("dynamodb:")
+            )
     return actions
 
 
@@ -122,6 +147,7 @@ def dynamodb_actions(name: str) -> set[str]:
         ("ValidateFunction", {"S3ReadPolicy", "S3WritePolicy"}),  # no DynamoDB
         ("CleanFunction", {"S3ReadPolicy", "S3WritePolicy"}),  # no DynamoDB
         ("StatsFunction", {"S3ReadPolicy"}),  # read-only
+        ("AnomaliesFunction", {"S3ReadPolicy", "S3WritePolicy"}),  # no DynamoDB
         ("StoreFunction", {"Statement"}),  # DynamoDB only, no S3
         ("FailFunction", {"S3ReadPolicy", "S3WritePolicy", "Statement"}),
     ],
@@ -149,6 +175,7 @@ def test_each_function_gets_only_the_kinds_of_access_its_step_needs(
         ("ValidateFunction", set()),
         ("CleanFunction", set()),
         ("StatsFunction", set()),
+        ("AnomaliesFunction", set()),
     ],
 )
 def test_dynamodb_actions_are_exactly_the_ones_the_step_uses(name: str, expected: set[str]) -> None:
@@ -168,3 +195,85 @@ def test_only_the_trigger_reads_the_queue() -> None:
 def test_queue_visibility_timeout_is_at_least_six_times_the_trigger_timeout() -> None:
     visibility = RESOURCES["UploadQueue"]["Properties"]["VisibilityTimeout"]
     assert visibility >= 6 * FUNCTIONS["TriggerFunction"]["Timeout"]
+
+
+# --- the container-image function, its settings and the wiring around it --------------
+
+IMAGE_FUNCTIONS = {
+    name
+    for name, props in RESOURCES.items()
+    if props.get("Properties", {}).get("PackageType") == "Image"
+}
+
+
+def test_only_the_anomalies_function_is_a_container_image() -> None:
+    assert {"AnomaliesFunction"} == IMAGE_FUNCTIONS
+
+
+def test_image_function_points_at_a_dockerfile_that_runs_the_same_handler() -> None:
+    metadata = RESOURCES["AnomaliesFunction"]["Metadata"]
+    assert metadata["DockerContext"] == "."  # the repository root: the Dockerfile copies src/
+    dockerfile = ROOT / metadata["Dockerfile"]
+    assert dockerfile.is_file()
+
+    text = dockerfile.read_text()
+    command = FUNCTIONS["AnomaliesFunction"]["ImageConfig"]["Command"][0]
+    assert f'CMD ["{command}"]' in text  # the template and the image agree
+    for copied in re.findall(r"^COPY (\S+) ", text, flags=re.MULTILINE):
+        assert (ROOT / copied).exists(), f"the Dockerfile copies {copied}, which does not exist"
+
+
+def test_image_function_has_none_of_the_zip_only_settings() -> None:
+    properties = FUNCTIONS["AnomaliesFunction"]
+    assert not {"Runtime", "CodeUri", "Layers", "Handler"} & set(properties)
+
+
+def test_zip_functions_each_set_runtime_code_and_the_pandas_layer() -> None:
+    zip_functions = set(FUNCTIONS) - IMAGE_FUNCTIONS
+    assert len(zip_functions) == 6
+    for name in zip_functions:
+        properties = FUNCTIONS[name]
+        assert properties["Runtime"] == "python3.12", name
+        assert properties["CodeUri"] == "src/", name
+        assert properties["Layers"] == [{"Ref": "PandasLayerArn"}], name
+
+
+def test_globals_hold_only_settings_valid_for_both_kinds_of_function() -> None:
+    assert not {"Runtime", "CodeUri", "Layers", "Handler"} & set(TEMPLATE["Globals"]["Function"])
+
+
+def test_store_can_read_only_the_work_prefix_of_the_processed_bucket() -> None:
+    statements = [
+        statement
+        for policy in FUNCTIONS["StoreFunction"]["Policies"]
+        for statement in policy.get("Statement", [])
+        if statement["Action"] == "s3:GetObject"
+    ]
+    assert len(statements) == 1
+    assert statements[0]["Resource"]["Sub"] == "${ProcessedBucket.Arn}/work/*"
+
+
+def test_anomaly_settings_are_wired_from_parameters_to_environment_variables() -> None:
+    anomalies_env = FUNCTIONS["AnomaliesFunction"]["Environment"]["Variables"]
+    assert anomalies_env["ZSCORE_LIMIT"] == {"Ref": "ZScoreLimit"}
+    assert anomalies_env["JUMP_THRESHOLD"] == {"Ref": "JumpThreshold"}
+    assert anomalies_env["IF_CONTAMINATION"] == {"Ref": "IfContamination"}
+    assert FUNCTIONS["StoreFunction"]["Environment"]["Variables"]["MAX_ANOMALIES"] == {
+        "Ref": "MaxAnomalies"
+    }
+
+
+def test_template_defaults_match_the_defaults_in_the_code() -> None:
+    """One source of truth per number: the template, the config loader and the detectors."""
+    parameters = TEMPLATE["Parameters"]
+    assert parameters["ZScoreLimit"]["Default"] == config.DEFAULT_ZSCORE_LIMIT
+    assert parameters["ZScoreLimit"]["Default"] == anomaly_defaults.DEFAULT_ZSCORE_LIMIT
+    assert parameters["JumpThreshold"]["Default"] == config.DEFAULT_JUMP_THRESHOLD
+    assert parameters["JumpThreshold"]["Default"] == anomaly_defaults.DEFAULT_JUMP_THRESHOLD
+    assert parameters["IfContamination"]["Default"] == config.DEFAULT_CONTAMINATION
+    assert parameters["MaxAnomalies"]["Default"] == config.DEFAULT_MAX_ANOMALIES
+
+
+def test_deploy_config_lets_sam_create_the_image_repository() -> None:
+    deploy = tomllib.loads((ROOT / "samconfig.toml").read_text())["default"]["deploy"]["parameters"]
+    assert deploy["resolve_image_repos"] is True
