@@ -21,6 +21,7 @@ from tests.unit.fakes import (
     FakeWorkflow,
 )
 
+from gradeflow.application.anomaly_step import DetectAnomaliesStep
 from gradeflow.application.pipeline_state import PipelineState
 from gradeflow.application.pipeline_steps import (
     CleanStep,
@@ -84,7 +85,12 @@ class Pipeline:
         data["stats"] = over_json(
             StatsStep(self.artifacts, 50).execute(PipelineState.from_dict(data))
         )
-        StoreStep(self.repository).execute(PipelineState.from_dict(data))
+        data["anomalies"] = over_json(
+            DetectAnomaliesStep(self.artifacts, 3.0, 30.0, 0.05)
+            .execute(PipelineState.from_dict(data))
+            .to_dict()
+        )
+        StoreStep(self.repository, self.artifacts).execute(PipelineState.from_dict(data))
 
 
 def test_sample_file_gives_the_verified_phase_3_results() -> None:
@@ -124,6 +130,8 @@ def test_meta_goes_processing_then_completed_and_stats_are_stored_before_complet
         "create_meta:PROCESSING",
         "delete_stats",
         "stats",
+        "delete_anomalies",
+        "anomalies",
         "meta:COMPLETED",
     ]
 
@@ -169,3 +177,28 @@ def test_two_datasets_do_not_interfere() -> None:
     assert pipeline.repository.current["ds-1"].status == DatasetStatus.COMPLETED
     assert pipeline.repository.current["ds-2"].status == DatasetStatus.COMPLETED
     assert set(pipeline.repository.stats) == {"ds-1", "ds-2"}
+
+
+def test_sample_file_anomalies_are_found_and_stored() -> None:
+    pipeline = Pipeline({"uploads/ds-1/results.csv": sample_csv()})
+    pipeline.run("ds-1")
+
+    meta = pipeline.repository.current["ds-1"]
+    stored = pipeline.repository.anomalies["ds-1"]
+    assert (meta.anomaly_count, meta.anomalies_stored) == (9, 9)
+    assert meta.ml_skipped is None
+    assert [a.method.value for a in stored] == ["duplicate_id"] + ["term_jump"] * 5 + [
+        "isolation_forest"
+    ] * 3
+    planted = {"S00034", "S00040", "S00055"}
+    assert planted <= {a.student_id for a in stored if a.method.value == "term_jump"}
+    assert planted == {a.student_id for a in stored if a.method.value == "isolation_forest"}
+    assert [a.student_id for a in stored if a.method.value == "duplicate_id"] == ["S00045"]
+
+
+def test_a_bad_file_never_reaches_the_anomalies_step() -> None:
+    pipeline = Pipeline({"uploads/ds-1/broken.csv": "student_id,score\nS00001,50\n"})
+    pipeline.run("ds-1", "broken.csv")
+
+    assert pipeline.repository.anomalies == {}
+    assert pipeline.artifacts.anomalies == {}
