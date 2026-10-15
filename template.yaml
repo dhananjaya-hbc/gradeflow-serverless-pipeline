@@ -461,8 +461,12 @@ Resources:
           CreateUsagePlan: PER_API
           Description: Caps request rate and volume, so a leaked key cannot run up a bill.
           Throttle:
-            RateLimit: 10 # requests per second
-            BurstLimit: 20
+            # Sized to what the account can serve: a new AWS account allows only 10 concurrent
+            # Lambda executions IN TOTAL, shared with the pipeline. Above that Lambda refuses
+            # and API Gateway answers a confusing 500. A burst of 10 keeps the excess as a clear
+            # 429 from the usage plan. Raise both after a Service Quotas increase for Lambda.
+            RateLimit: 5 # requests per second
+            BurstLimit: 10
           Quota:
             Limit: 5000
             Period: DAY
