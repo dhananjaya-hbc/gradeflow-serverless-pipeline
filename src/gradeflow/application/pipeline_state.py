@@ -47,6 +47,33 @@ class CleaningOutcome:
 
 
 @dataclass(frozen=True)
+class AnomalyOutcome:
+    """Result of the Anomalies step. The findings themselves are in S3, not in the state
+    (a big file can produce thousands, and a state payload is limited to 256 KB)."""
+
+    total: int
+    by_method: dict[str, int]  # e.g. {"term_jump": 5, "duplicate_id": 1}
+    anomalies_key: str
+    ml_skipped: str | None = None  # why the Isolation Forest did not run, if it did not
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "AnomalyOutcome":
+        return cls(**data)
+
+
+def require[T](value: T | None, name: str) -> T:
+    """Return a state section, or fail loudly if the state machine did not provide it."""
+    if value is None:
+        raise ValueError(
+            f"pipeline state has no '{name}': the state machine passed the wrong input"
+        )
+    return value
+
+
+@dataclass(frozen=True)
 class PipelineState:
     """Everything known about one run. Sections are None until their step has run."""
 
@@ -58,6 +85,7 @@ class PipelineState:
     validation: ValidationOutcome | None = None
     cleaning: CleaningOutcome | None = None
     stats: dict[str, Any] | None = None  # stats_to_dict() output
+    anomalies: AnomalyOutcome | None = None
     error: dict[str, Any] | None = None  # set by the state machine's Catch: {Error, Cause}
 
     @property
@@ -83,6 +111,8 @@ class PipelineState:
             data["cleaning"] = self.cleaning.to_dict()
         if self.stats is not None:
             data["stats"] = self.stats
+        if self.anomalies is not None:
+            data["anomalies"] = self.anomalies.to_dict()
         if self.error is not None:
             data["error"] = self.error
         return data
@@ -90,6 +120,7 @@ class PipelineState:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "PipelineState":
         validation, cleaning = data.get("validation"), data.get("cleaning")
+        anomalies = data.get("anomalies")
         return cls(
             dataset_id=data["dataset_id"],
             bucket=data["bucket"],
@@ -99,5 +130,6 @@ class PipelineState:
             validation=ValidationOutcome.from_dict(validation) if validation else None,
             cleaning=CleaningOutcome.from_dict(cleaning) if cleaning else None,
             stats=data.get("stats"),
+            anomalies=AnomalyOutcome.from_dict(anomalies) if anomalies else None,
             error=data.get("error"),
         )
