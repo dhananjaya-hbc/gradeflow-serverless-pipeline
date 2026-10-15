@@ -1,7 +1,6 @@
 """Integration tests for the boto3 adapters, against moto's in-memory fake AWS."""
 
 import json
-from collections.abc import Iterator
 from decimal import Decimal
 
 import boto3
@@ -9,7 +8,6 @@ import pandas as pd
 import pytest
 from boto3.dynamodb.conditions import Key
 from botocore.exceptions import ClientError
-from moto import mock_aws
 
 from gradeflow.domain.anomalies import Anomaly, AnomalyMethod
 from gradeflow.domain.dataset import DatasetMeta, DatasetStatus
@@ -31,43 +29,6 @@ from gradeflow.infrastructure.step_functions_starter import StepFunctionsStarter
 
 REGION = "ap-south-1"
 TABLE = "PipelineTable"
-
-
-@pytest.fixture(autouse=True)
-def fake_aws(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """Fake credentials so nothing can ever reach a real AWS account."""
-    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
-    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
-    monkeypatch.setenv("AWS_DEFAULT_REGION", REGION)
-    with mock_aws():
-        yield
-
-
-@pytest.fixture
-def table():
-    """Create a PipelineTable with the same keys and GSI as template.yaml."""
-    return boto3.resource("dynamodb").create_table(
-        TableName=TABLE,
-        BillingMode="PAY_PER_REQUEST",
-        KeySchema=[
-            {"AttributeName": "PK", "KeyType": "HASH"},
-            {"AttributeName": "SK", "KeyType": "RANGE"},
-        ],
-        AttributeDefinitions=[
-            {"AttributeName": name, "AttributeType": "S"}
-            for name in ("PK", "SK", "GSI1PK", "GSI1SK")
-        ],
-        GlobalSecondaryIndexes=[
-            {
-                "IndexName": "GSI1",
-                "KeySchema": [
-                    {"AttributeName": "GSI1PK", "KeyType": "HASH"},
-                    {"AttributeName": "GSI1SK", "KeyType": "RANGE"},
-                ],
-                "Projection": {"ProjectionType": "ALL"},
-            }
-        ],
-    )
 
 
 def make_meta(dataset_id: str = "ds-1", **overrides: object) -> DatasetMeta:
