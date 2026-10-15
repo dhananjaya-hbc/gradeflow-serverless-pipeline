@@ -287,12 +287,18 @@ def completed_state() -> PipelineState:
 
 
 def test_store_step_saves_stats_then_marks_completed_last() -> None:
-    repository = FakeRepository()
-    state = completed_state()
+    repository, artifacts = FakeRepository(), FakeArtifacts()
+    state = state_with_anomalies(artifacts, [])
 
-    meta = StoreStep(repository).execute(state)
+    meta = StoreStep(repository, artifacts).execute(state)
 
-    assert repository.calls == ["delete_stats", "stats", "meta:COMPLETED"]
+    assert repository.calls == [
+        "delete_stats",
+        "stats",
+        "delete_anomalies",
+        "anomalies",
+        "meta:COMPLETED",
+    ]
     assert repository.current["ds-1"] == meta
     assert meta.status == DatasetStatus.COMPLETED
     assert (meta.total_rows, meta.valid_rows, meta.invalid_rows) == (3, 2, 1)
@@ -305,13 +311,20 @@ def test_store_step_saves_stats_then_marks_completed_last() -> None:
 
 
 def test_store_step_replaces_stats_of_an_earlier_run() -> None:
-    repository = FakeRepository()
-    StoreStep(repository).execute(completed_state())
+    repository, artifacts = FakeRepository(), FakeArtifacts()
+    state = state_with_anomalies(artifacts, [])
+    StoreStep(repository, artifacts).execute(state)
     first = repository.stats["ds-1"]
 
-    StoreStep(repository).execute(completed_state())
+    StoreStep(repository, artifacts).execute(state)
 
-    assert repository.calls[-3:] == ["delete_stats", "stats", "meta:COMPLETED"]
+    assert repository.calls[-5:] == [
+        "delete_stats",
+        "stats",
+        "delete_anomalies",
+        "anomalies",
+        "meta:COMPLETED",
+    ]
     assert repository.stats["ds-1"] == first
 
 
@@ -395,19 +408,28 @@ def test_reprocessing_replaces_the_previous_anomalies() -> None:
     assert repository.calls.count("delete_anomalies") == 2
 
 
-def test_store_needs_artifacts_to_read_anomalies() -> None:
-    artifacts = FakeArtifacts()
-    state = state_with_anomalies(artifacts, findings(1))
-    with pytest.raises(ValueError, match="needs artifacts"):
-        StoreStep(FakeRepository()).execute(state)
-
-
-def test_runs_without_an_anomalies_section_still_complete() -> None:
-    """Runs started before the Anomalies step existed have no section: nothing to store."""
+def test_store_requires_the_anomalies_section_and_writes_nothing_without_it() -> None:
+    """A state machine that skips the Anomalies step must fail loudly, with no partial writes."""
     repository = FakeRepository()
-    meta = StoreStep(repository).execute(completed_state())
-    assert "anomalies" not in repository.calls
-    assert (meta.anomaly_count, meta.anomalies_stored) == (0, 0)
+
+    with pytest.raises(ValueError, match="no 'anomalies'"):
+        StoreStep(repository, FakeArtifacts()).execute(completed_state())
+
+    assert repository.calls == []  # not even the stats were saved
+    assert repository.current == {}
+
+
+def test_a_missing_anomalies_file_fails_instead_of_storing_nothing() -> None:
+    """The section names a file that is not there: an error, never a silent 'no anomalies'."""
+    artifacts = FakeArtifacts()
+    state = state_with_anomalies(artifacts, findings(2))
+    del artifacts.anomalies["work/ds-1/anomalies.jsonl"]
+    repository = FakeRepository()
+
+    with pytest.raises(KeyError):
+        StoreStep(repository, artifacts).execute(state)
+
+    assert repository.calls == []
 
 
 # --- Reject --------------------------------------------------------------------------
