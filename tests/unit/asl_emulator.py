@@ -20,6 +20,7 @@ SUBSTITUTIONS = {
     "ValidateFunctionArn": "fn:validate",
     "CleanFunctionArn": "fn:clean",
     "StatsFunctionArn": "fn:stats",
+    "AnomaliesFunctionArn": "fn:anomalies",
     "StoreFunctionArn": "fn:store",
     "FailFunctionArn": "fn:fail",
     "AlertTopicArn": "topic:alerts",
