@@ -4,6 +4,7 @@ from typing import Any
 
 import pandas as pd
 
+from gradeflow.domain.anomalies import Anomaly
 from gradeflow.domain.dataset import DatasetMeta
 from gradeflow.domain.statistics import DatasetStats
 from gradeflow.domain.validation import Row
@@ -25,6 +26,7 @@ class FakeArtifacts:
     def __init__(self) -> None:
         self.valid_rows: dict[str, list[Row]] = {}
         self.clean_data: dict[str, pd.DataFrame] = {}
+        self.anomalies: dict[str, list[Anomaly]] = {}
 
     def save_valid_rows(self, dataset_id: str, rows: list[Row]) -> str:
         key = f"work/{dataset_id}/valid.jsonl"
@@ -41,6 +43,14 @@ class FakeArtifacts:
 
     def load_clean_data(self, key: str) -> pd.DataFrame:
         return self.clean_data[key]
+
+    def save_anomalies(self, dataset_id: str, anomalies: list[Anomaly]) -> str:
+        key = f"work/{dataset_id}/anomalies.jsonl"
+        self.anomalies[key] = list(anomalies)
+        return key
+
+    def load_anomalies(self, key: str) -> list[Anomaly]:
+        return self.anomalies[key]
 
 
 class FakeQuarantine:
@@ -61,6 +71,7 @@ class FakeRepository:
         self.metas: list[DatasetMeta] = []  # every save, in order
         self.current: dict[str, DatasetMeta] = {}  # latest META per dataset
         self.stats: dict[str, DatasetStats] = {}
+        self.anomalies: dict[str, list[Anomaly]] = {}
         self.claims: dict[str, str] = {}  # sha256 -> owning dataset_id
         self.calls: list[str] = []
 
@@ -84,6 +95,14 @@ class FakeRepository:
     def delete_stats(self, dataset_id: str) -> None:
         self.stats.pop(dataset_id, None)
         self.calls.append("delete_stats")
+
+    def save_anomalies(self, dataset_id: str, anomalies: list[Anomaly]) -> None:
+        self.anomalies[dataset_id] = list(anomalies)
+        self.calls.append("anomalies")
+
+    def delete_anomalies(self, dataset_id: str) -> None:
+        self.anomalies.pop(dataset_id, None)
+        self.calls.append("delete_anomalies")
 
     def claim_file_hash(self, sha256: str, dataset_id: str) -> str | None:
         self.calls.append("claim")
