@@ -322,10 +322,18 @@ def test_the_key_is_required_per_route_not_for_the_whole_api() -> None:
     assert not any(event["Method"] == "OPTIONS" for event in API_EVENTS.values())
 
 
+def test_the_burst_limit_does_not_exceed_a_new_accounts_lambda_concurrency() -> None:
+    """A new AWS account allows 10 concurrent Lambda executions in total. A burst above that
+    reaches Lambda, which refuses, and API Gateway shows a 500 instead of a clear 429 (seen
+    when 60 simultaneous requests gave 40 of them a 500)."""
+    new_account_concurrency = 10
+    assert API["Auth"]["UsagePlan"]["Throttle"]["BurstLimit"] <= new_account_concurrency
+
+
 def test_the_usage_plan_caps_rate_and_volume() -> None:
     plan = API["Auth"]["UsagePlan"]
     assert plan["CreateUsagePlan"] == "PER_API"
-    assert plan["Throttle"] == {"RateLimit": 10, "BurstLimit": 20}
+    assert plan["Throttle"] == {"RateLimit": 5, "BurstLimit": 10}
     assert plan["Quota"] == {"Limit": 5000, "Period": "DAY"}
 
 
