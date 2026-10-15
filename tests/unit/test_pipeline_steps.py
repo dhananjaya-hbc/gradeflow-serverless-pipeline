@@ -14,7 +14,12 @@ from tests.unit.fakes import (
     FakeWorkflow,
 )
 
-from gradeflow.application.pipeline_state import CleaningOutcome, PipelineState, ValidationOutcome
+from gradeflow.application.pipeline_state import (
+    AnomalyOutcome,
+    CleaningOutcome,
+    PipelineState,
+    ValidationOutcome,
+)
 from gradeflow.application.pipeline_steps import (
     MAX_ERROR_MESSAGE,
     CleanStep,
@@ -27,6 +32,7 @@ from gradeflow.application.pipeline_steps import (
     ValidateStep,
     execution_name,
 )
+from gradeflow.domain.anomalies import Anomaly, AnomalyMethod
 from gradeflow.domain.dataset import DatasetStatus
 from gradeflow.domain.fingerprint import sha256_hex
 
@@ -307,6 +313,101 @@ def test_store_step_replaces_stats_of_an_earlier_run() -> None:
 
     assert repository.calls[-3:] == ["delete_stats", "stats", "meta:COMPLETED"]
     assert repository.stats["ds-1"] == first
+
+
+def findings(count: int) -> list[Anomaly]:
+    """`count` anomalies, already ranked (most important first), as the Anomalies step saves."""
+    return [
+        Anomaly(
+            method=AnomalyMethod.TERM_JUMP,
+            student_id=f"S{i:05d}",
+            severity=float(100 - i),
+            details=f"finding {i}",
+        )
+        for i in range(1, count + 1)
+    ]
+
+
+def state_with_anomalies(
+    artifacts: FakeArtifacts, found: list[Anomaly], skipped: str | None = None
+):
+    key = artifacts.save_anomalies("ds-1", found)
+    outcome = AnomalyOutcome(total=len(found), by_method={}, anomalies_key=key, ml_skipped=skipped)
+    return PipelineState.from_dict({**completed_state().to_dict(), "anomalies": outcome.to_dict()})
+
+
+def test_store_saves_anomalies_between_stats_and_the_final_status() -> None:
+    repository, artifacts = FakeRepository(), FakeArtifacts()
+    state = state_with_anomalies(artifacts, findings(3))
+
+    meta = StoreStep(repository, artifacts).execute(state)
+
+    assert repository.calls == [
+        "delete_stats",
+        "stats",
+        "delete_anomalies",
+        "anomalies",
+        "meta:COMPLETED",
+    ]
+    assert [a.details for a in repository.anomalies["ds-1"]] == [
+        "finding 1",
+        "finding 2",
+        "finding 3",
+    ]
+    assert (meta.anomaly_count, meta.anomalies_stored, meta.ml_skipped) == (3, 3, None)
+
+
+def test_store_keeps_only_the_most_important_anomalies_but_records_the_true_total() -> None:
+    repository, artifacts = FakeRepository(), FakeArtifacts()
+    state = state_with_anomalies(artifacts, findings(5))
+
+    meta = StoreStep(repository, artifacts, max_anomalies=2).execute(state)
+
+    assert [a.details for a in repository.anomalies["ds-1"]] == ["finding 1", "finding 2"]
+    assert (meta.anomaly_count, meta.anomalies_stored) == (5, 2)
+
+
+def test_store_records_why_the_forest_was_skipped() -> None:
+    repository, artifacts = FakeRepository(), FakeArtifacts()
+    reason = "only 10 students, at least 20 are needed"
+    state = state_with_anomalies(artifacts, findings(1), skipped=reason)
+
+    assert StoreStep(repository, artifacts).execute(state).ml_skipped == reason
+
+
+def test_store_with_no_anomalies_clears_old_ones_and_stores_none() -> None:
+    repository, artifacts = FakeRepository(), FakeArtifacts()
+    repository.anomalies["ds-1"] = findings(4)  # left over from an earlier upload
+
+    meta = StoreStep(repository, artifacts).execute(state_with_anomalies(artifacts, []))
+
+    assert repository.anomalies["ds-1"] == []
+    assert (meta.anomaly_count, meta.anomalies_stored) == (0, 0)
+
+
+def test_reprocessing_replaces_the_previous_anomalies() -> None:
+    repository, artifacts = FakeRepository(), FakeArtifacts()
+    StoreStep(repository, artifacts).execute(state_with_anomalies(artifacts, findings(4)))
+
+    StoreStep(repository, artifacts).execute(state_with_anomalies(artifacts, findings(2)))
+
+    assert len(repository.anomalies["ds-1"]) == 2
+    assert repository.calls.count("delete_anomalies") == 2
+
+
+def test_store_needs_artifacts_to_read_anomalies() -> None:
+    artifacts = FakeArtifacts()
+    state = state_with_anomalies(artifacts, findings(1))
+    with pytest.raises(ValueError, match="needs artifacts"):
+        StoreStep(FakeRepository()).execute(state)
+
+
+def test_runs_without_an_anomalies_section_still_complete() -> None:
+    """Runs started before the Anomalies step existed have no section: nothing to store."""
+    repository = FakeRepository()
+    meta = StoreStep(repository).execute(completed_state())
+    assert "anomalies" not in repository.calls
+    assert (meta.anomaly_count, meta.anomalies_stored) == (0, 0)
 
 
 # --- Reject --------------------------------------------------------------------------
