@@ -50,6 +50,7 @@ LOADERS = {
     "CleanFunction": config.load_clean_config,
     "StatsFunction": config.load_stats_config,
     "AnomaliesFunction": config.load_anomalies_config,
+    "ApiFunction": config.load_api_config,
     "StoreFunction": config.load_store_config,
     "FailFunction": config.load_reject_config,
 }
@@ -117,7 +118,7 @@ def test_the_state_machine_may_invoke_exactly_the_workflow_functions() -> None:
         for policy in policies
         if "LambdaInvokePolicy" in policy
     }
-    assert invoked == set(FUNCTIONS) - {"TriggerFunction"}  # the trigger calls the machine
+    assert invoked == set(FUNCTIONS) - {"TriggerFunction", "ApiFunction"}  # those two are not steps
 
 
 # --- the intended permissions, pinned so changes are deliberate -----------------------
@@ -148,6 +149,7 @@ def dynamodb_actions(name: str) -> set[str]:
         ("CleanFunction", {"S3ReadPolicy", "S3WritePolicy"}),  # no DynamoDB
         ("StatsFunction", {"S3ReadPolicy"}),  # read-only
         ("AnomaliesFunction", {"S3ReadPolicy", "S3WritePolicy"}),  # no DynamoDB
+        ("ApiFunction", {"Statement"}),  # read DynamoDB, sign S3 uploads: both custom statements
         ("StoreFunction", {"Statement"}),  # DynamoDB only, no S3
         ("FailFunction", {"S3ReadPolicy", "S3WritePolicy", "Statement"}),
     ],
@@ -176,6 +178,7 @@ def test_each_function_gets_only_the_kinds_of_access_its_step_needs(
         ("CleanFunction", set()),
         ("StatsFunction", set()),
         ("AnomaliesFunction", set()),
+        ("ApiFunction", {"dynamodb:GetItem", "dynamodb:Query"}),  # read-only
     ],
 )
 def test_dynamodb_actions_are_exactly_the_ones_the_step_uses(name: str, expected: set[str]) -> None:
@@ -228,14 +231,21 @@ def test_image_function_has_none_of_the_zip_only_settings() -> None:
     assert not {"Runtime", "CodeUri", "Layers", "Handler"} & set(properties)
 
 
-def test_zip_functions_each_set_runtime_code_and_the_pandas_layer() -> None:
-    zip_functions = set(FUNCTIONS) - IMAGE_FUNCTIONS
-    assert len(zip_functions) == 6
-    for name in zip_functions:
+def test_the_six_pipeline_functions_each_set_runtime_code_and_the_pandas_layer() -> None:
+    pipeline_functions = set(FUNCTIONS) - IMAGE_FUNCTIONS - {"ApiFunction"}
+    assert len(pipeline_functions) == 6
+    for name in pipeline_functions:
         properties = FUNCTIONS[name]
         assert properties["Runtime"] == "python3.12", name
         assert properties["CodeUri"] == "src/", name
         assert properties["Layers"] == [{"Ref": "PandasLayerArn"}], name
+
+
+def test_the_api_function_is_a_plain_zip_function_with_no_pandas_layer() -> None:
+    """It only reads stored items, so it skips the heavy layer and starts faster."""
+    properties = FUNCTIONS["ApiFunction"]
+    assert (properties["Runtime"], properties["CodeUri"]) == ("python3.12", "src/")
+    assert "Layers" not in properties and "PackageType" not in properties
 
 
 def test_globals_hold_only_settings_valid_for_both_kinds_of_function() -> None:
@@ -277,3 +287,111 @@ def test_template_defaults_match_the_defaults_in_the_code() -> None:
 def test_deploy_config_lets_sam_create_the_image_repository() -> None:
     deploy = tomllib.loads((ROOT / "samconfig.toml").read_text())["default"]["deploy"]["parameters"]
     assert deploy["resolve_image_repos"] is True
+
+
+# --- the Analytics API ------------------------------------------------------------------
+
+API = RESOURCES["AnalyticsApi"]["Properties"]
+API_EVENTS = {
+    name: event["Properties"] for name, event in FUNCTIONS["ApiFunction"]["Events"].items()
+}
+
+
+def test_the_api_serves_exactly_the_five_documented_routes() -> None:
+    routes = {(event["Method"], event["Path"]) for event in API_EVENTS.values()}
+    assert routes == {
+        ("GET", "/datasets"),
+        ("GET", "/datasets/{id}"),
+        ("GET", "/datasets/{id}/stats"),
+        ("GET", "/datasets/{id}/anomalies"),
+        ("POST", "/uploads"),
+    }
+    assert all(event["RestApiId"] == {"Ref": "AnalyticsApi"} for event in API_EVENTS.values())
+
+
+def test_every_route_requires_the_api_key() -> None:
+    for name, event in API_EVENTS.items():
+        assert event["Auth"]["ApiKeyRequired"] is True, f"{name} would be open to anyone"
+
+
+def test_the_key_is_required_per_route_not_for_the_whole_api() -> None:
+    """A browser's CORS preflight (OPTIONS) carries no custom headers. If the whole API
+    required the key, SAM would require it on the preflight too and every browser call would
+    fail with 403. Found by expanding the template; this pins the fix."""
+    assert "ApiKeyRequired" not in API["Auth"]
+    assert not any(event["Method"] == "OPTIONS" for event in API_EVENTS.values())
+
+
+def test_the_usage_plan_caps_rate_and_volume() -> None:
+    plan = API["Auth"]["UsagePlan"]
+    assert plan["CreateUsagePlan"] == "PER_API"
+    assert plan["Throttle"] == {"RateLimit": 10, "BurstLimit": 20}
+    assert plan["Quota"] == {"Limit": 5000, "Period": "DAY"}
+
+
+def test_the_stage_is_versioned() -> None:
+    assert API["StageName"] == "v1"
+
+
+def test_cors_allows_the_key_header_and_takes_its_origin_from_the_parameter() -> None:
+    cors = API["Cors"]
+    assert cors["AllowOrigin"] == {"Sub": "'${AllowedOrigin}'"}
+    assert "X-Api-Key" in cors["AllowHeaders"] and "Content-Type" in cors["AllowHeaders"]
+    assert cors["AllowMethods"] == "'GET,POST,OPTIONS'"
+    assert FUNCTIONS["ApiFunction"]["Environment"]["Variables"]["ALLOWED_ORIGIN"] == {
+        "Ref": "AllowedOrigin"
+    }
+
+
+def test_the_allowed_origin_default_matches_the_code() -> None:
+    default = TEMPLATE["Parameters"]["AllowedOrigin"]["Default"]
+    assert default == config.load_api_config({"TABLE_NAME": "t", "RAW_BUCKET": "b"}).allowed_origin
+
+
+def test_the_api_function_can_only_read_the_table_and_its_index() -> None:
+    statements = [
+        statement
+        for policy in FUNCTIONS["ApiFunction"]["Policies"]
+        for statement in policy["Statement"]
+        if "dynamodb:GetItem" in statement["Action"]
+    ]
+    assert len(statements) == 1
+    assert statements[0]["Resource"] == [
+        {"GetAtt": "PipelineTable.Arn"},
+        {"Sub": "${PipelineTable.Arn}/index/GSI1"},  # an index is a separate resource
+    ]
+
+
+@pytest.mark.parametrize(
+    "forbidden",
+    ["PutItem", "DeleteItem", "UpdateItem", "BatchWriteItem", "Scan", "BatchGetItem"],
+)
+def test_the_api_function_has_no_other_dynamodb_action(forbidden: str) -> None:
+    assert f"dynamodb:{forbidden}" not in dynamodb_actions("ApiFunction")
+
+
+def test_the_api_function_can_only_write_objects_under_uploads() -> None:
+    """It signs upload forms; a form can only do what the signer's own role may do."""
+    s3_statements = [
+        statement
+        for policy in FUNCTIONS["ApiFunction"]["Policies"]
+        for statement in policy["Statement"]
+        if str(statement["Action"]).startswith("s3:")
+    ]
+    assert len(s3_statements) == 1
+    assert s3_statements[0]["Action"] == "s3:PutObject"
+    assert s3_statements[0]["Resource"] == {"Sub": "${RawBucket.Arn}/uploads/*"}
+
+
+def test_the_api_function_finishes_before_api_gateway_gives_up() -> None:
+    """API Gateway cuts an integration off after 29 seconds."""
+    assert FUNCTIONS["ApiFunction"]["Timeout"] < 29
+
+
+def test_the_outputs_give_the_url_and_the_key_id_but_never_the_key() -> None:
+    outputs = TEMPLATE["Outputs"]
+    assert outputs["ApiKeyId"]["Value"] == {"Ref": "AnalyticsApiApiKey"}
+    assert "execute-api" in outputs["ApiUrl"]["Value"]["Sub"] and outputs["ApiUrl"]["Value"][
+        "Sub"
+    ].endswith("/v1")
+    assert "get-api-key" in outputs["ApiKeyId"]["Description"]  # says how to fetch the secret
