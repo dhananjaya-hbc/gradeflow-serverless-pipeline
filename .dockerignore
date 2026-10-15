@@ -1,0 +1,16 @@
+# Keep the build context small: the image only needs docker/anomalies/ and src/gradeflow/.
+.git
+.github
+.venv
+.aws-sam
+.pytest_cache
+.ruff_cache
+**/__pycache__
+**/*.pyc
+data
+dashboard
+tests
+docs
+scripts
+statemachine
+*.md
