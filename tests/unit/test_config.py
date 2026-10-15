@@ -31,7 +31,9 @@ def test_each_loader_reads_only_its_own_variables() -> None:
     )
     assert load_clean_config({"PROCESSED_BUCKET": "p"}).processed_bucket == "p"
     assert load_stats_config({"PROCESSED_BUCKET": "p", "PASS_MARK": "40"}) == StatsConfig("p", 40.0)
-    assert load_store_config({"TABLE_NAME": "T"}) == StoreConfig("T")
+    assert load_store_config({"TABLE_NAME": "T", "PROCESSED_BUCKET": "p"}) == StoreConfig(
+        "T", "p", 500
+    )
     assert load_reject_config({"TABLE_NAME": "T", "QUARANTINE_BUCKET": "q"}) == RejectConfig(
         "T", "q"
     )
@@ -42,9 +44,10 @@ def test_defaults() -> None:
     assert load_stats_config({"PROCESSED_BUCKET": "p"}).pass_mark == 50.0
 
 
-def test_store_does_not_need_buckets_and_clean_does_not_need_the_table() -> None:
-    """Least privilege shows up in config too: a function only sees what it may use."""
-    assert load_store_config({"TABLE_NAME": "T"}).table_name == "T"
+def test_store_needs_the_processed_bucket_and_clean_does_not_need_the_table() -> None:
+    """Store reads the anomalies file; Clean only works on files, so it has no table."""
+    with pytest.raises(ConfigError, match="PROCESSED_BUCKET"):
+        load_store_config({"TABLE_NAME": "T"})
     assert load_clean_config({"PROCESSED_BUCKET": "p"}).processed_bucket == "p"
 
 
@@ -62,10 +65,11 @@ def test_reads_os_environ_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
         (load_validate_config, {}, "PROCESSED_BUCKET"),
         (load_clean_config, {}, "PROCESSED_BUCKET"),
         (load_stats_config, {}, "PROCESSED_BUCKET"),
-        (load_store_config, {}, "TABLE_NAME"),
+        (load_store_config, {"PROCESSED_BUCKET": "p"}, "TABLE_NAME"),
+        (load_store_config, {"TABLE_NAME": "T"}, "PROCESSED_BUCKET"),
         (load_reject_config, {"QUARANTINE_BUCKET": "q"}, "TABLE_NAME"),
         (load_reject_config, {"TABLE_NAME": "T"}, "QUARANTINE_BUCKET"),
-        (load_store_config, {"TABLE_NAME": "  "}, "TABLE_NAME"),
+        (load_store_config, {"TABLE_NAME": "  ", "PROCESSED_BUCKET": "p"}, "TABLE_NAME"),
     ],
 )
 def test_missing_required_value(loader, env: dict[str, str], missing: str) -> None:
@@ -123,10 +127,10 @@ def test_store_config_reads_the_anomaly_settings() -> None:
 
 
 def test_store_config_defaults_to_500_anomalies() -> None:
-    assert load_store_config({"TABLE_NAME": "T"}).max_anomalies == 500
+    assert load_store_config({"TABLE_NAME": "T", "PROCESSED_BUCKET": "p"}).max_anomalies == 500
 
 
 @pytest.mark.parametrize("value", ["0", "10001", "abc", "1.5", "-3"])
 def test_store_config_rejects_a_bad_anomaly_cap(value: str) -> None:
     with pytest.raises(ConfigError, match="MAX_ANOMALIES"):
-        load_store_config({"TABLE_NAME": "T", "MAX_ANOMALIES": value})
+        load_store_config({"TABLE_NAME": "T", "PROCESSED_BUCKET": "p", "MAX_ANOMALIES": value})
