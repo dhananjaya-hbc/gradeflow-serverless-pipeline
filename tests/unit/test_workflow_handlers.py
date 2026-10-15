@@ -16,6 +16,7 @@ from tests.unit.fakes import (
     FakeWorkflow,
 )
 
+from gradeflow.application.anomaly_step import DetectAnomaliesStep
 from gradeflow.application.pipeline_state import PipelineState
 from gradeflow.application.pipeline_steps import (
     CleanStep,
@@ -28,6 +29,7 @@ from gradeflow.application.pipeline_steps import (
 )
 from gradeflow.domain.dataset import DatasetStatus
 from gradeflow.entrypoints import (
+    anomalies_handler,
     clean_handler,
     fail_handler,
     stats_handler,
@@ -78,11 +80,36 @@ def test_chain_of_handlers_completes_a_dataset() -> None:
     assert (state["cleaning"]["clean_rows"], state["cleaning"]["duplicates_removed"]) == (2, 1)
     state["stats"] = over_json(stats_handler.process(state, StatsStep(stack.artifacts, 50)))
     assert state["stats"]["overall"]["pass_rate"] == 50.0
-    result = store_handler.process(state, StoreStep(stack.repository))
+    state["anomalies"] = over_json(
+        anomalies_handler.process(state, DetectAnomaliesStep(stack.artifacts, 3.0, 30.0, 0.05))
+    )
+    result = store_handler.process(state, StoreStep(stack.repository, stack.artifacts))
 
     assert result == {"dataset_id": "ds-1", "status": "COMPLETED"}
     assert stack.repository.current["ds-1"].status == DatasetStatus.COMPLETED
     assert stack.repository.stats["ds-1"].student_count == 2
+    assert stack.repository.current["ds-1"].anomaly_count == state["anomalies"]["total"]
+
+
+def test_anomalies_handler_returns_the_anomalies_section() -> None:
+    stack = Stack({"uploads/ds-1/results.csv": HEADER + GOOD + GOOD_2})
+    state = stack.initial_state("uploads/ds-1/results.csv")
+    state["validation"] = over_json(
+        validate_handler.process(state, ValidateStep(stack.storage, stack.artifacts, 0.8))
+    )
+    state["cleaning"] = over_json(clean_handler.process(state, CleanStep(stack.artifacts)))
+
+    section = anomalies_handler.process(
+        state, DetectAnomaliesStep(stack.artifacts, 3.0, 30.0, 0.05)
+    )
+
+    assert section == {
+        "total": 0,
+        "by_method": {},
+        "anomalies_key": "work/ds-1/anomalies.jsonl",
+        "ml_skipped": "only 2 students, at least 20 are needed",
+    }
+    json.dumps(section)  # must be JSON-serialisable for Step Functions
 
 
 def test_validate_handler_returns_the_validation_section() -> None:
@@ -219,10 +246,28 @@ def test_stats_handler_wiring(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_store_handler_wiring(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TABLE_NAME", "PipelineTable")
+    monkeypatch.setenv("PROCESSED_BUCKET", "processed-bucket")
+    monkeypatch.setenv("MAX_ANOMALIES", "200")
 
     step = build_fresh(store_handler)
 
     assert isinstance(step._repository, DynamoDbDatasetRepository)
+    assert isinstance(step._artifacts, S3DatasetArtifacts)
+    assert step._artifacts._bucket == "processed-bucket"
+    assert step._max_anomalies == 200
+
+
+def test_anomalies_handler_wiring(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PROCESSED_BUCKET", "processed-bucket")
+    monkeypatch.setenv("ZSCORE_LIMIT", "2.5")
+    monkeypatch.setenv("JUMP_THRESHOLD", "40")
+    monkeypatch.setenv("IF_CONTAMINATION", "0.1")
+
+    step = build_fresh(anomalies_handler)
+
+    assert isinstance(step._artifacts, S3DatasetArtifacts)
+    assert step._artifacts._bucket == "processed-bucket"
+    assert (step._zscore_limit, step._jump_threshold, step._contamination) == (2.5, 40.0, 0.1)
 
 
 def test_fail_handler_wiring(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -242,6 +287,7 @@ def test_fail_handler_wiring(monkeypatch: pytest.MonkeyPatch) -> None:
         (validate_handler, "PROCESSED_BUCKET"),
         (clean_handler, "PROCESSED_BUCKET"),
         (stats_handler, "PROCESSED_BUCKET"),
+        (anomalies_handler, "PROCESSED_BUCKET"),
         (store_handler, "TABLE_NAME"),
         (fail_handler, "TABLE_NAME"),
     ],
