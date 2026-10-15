@@ -2,7 +2,15 @@
 
 import json
 
-from gradeflow.application.pipeline_state import CleaningOutcome, PipelineState, ValidationOutcome
+import pytest
+
+from gradeflow.application.pipeline_state import (
+    AnomalyOutcome,
+    CleaningOutcome,
+    PipelineState,
+    ValidationOutcome,
+    require,
+)
 
 BASE = {
     "dataset_id": "ds-1",
@@ -36,6 +44,12 @@ def test_full_state_round_trip_through_json() -> None:
             clean_rows=8, duplicates_removed=1, processed_key="p/ds-1.parquet"
         ),
         stats={"overall": {"count": 8}},
+        anomalies=AnomalyOutcome(
+            total=6,
+            by_method={"term_jump": 5, "duplicate_id": 1},
+            anomalies_key="work/ds-1/anomalies.jsonl",
+            ml_skipped="only 3 students, at least 20 are needed",
+        ),
         error={"Error": "States.TaskFailed", "Cause": "boom"},
     )
 
@@ -43,6 +57,7 @@ def test_full_state_round_trip_through_json() -> None:
 
     assert restored == state
     assert isinstance(restored.validation.row_errors, tuple)
+    assert restored.anomalies.by_method == {"term_jump": 5, "duplicate_id": 1}
 
 
 def test_derived_fields() -> None:
@@ -63,3 +78,15 @@ def test_validation_outcome_defaults_for_a_bad_file() -> None:
         "valid_key": None,
         "error_message": "file contains no data rows",
     }
+
+
+def test_anomaly_outcome_without_a_skip_reason() -> None:
+    outcome = AnomalyOutcome(total=0, by_method={}, anomalies_key="k")
+    assert AnomalyOutcome.from_dict(outcome.to_dict()) == outcome
+    assert outcome.to_dict()["ml_skipped"] is None
+
+
+def test_require_returns_the_value_or_fails_loudly() -> None:
+    assert require("x", "section") == "x"
+    with pytest.raises(ValueError, match="no 'anomalies'"):
+        require(None, "anomalies")
