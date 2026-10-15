@@ -31,6 +31,13 @@ class AnomalyMethod(StrEnum):
     ISOLATION_FOREST = "isolation_forest"
 
 
+# What happened to a score after it jumped. A spike (it went back) is more suspicious than a
+# change that held, and a change in the latest term cannot be judged yet.
+PATTERN_SPIKE = "spike"
+PATTERN_LATEST = "latest"
+PATTERN_SUSTAINED = "sustained"
+_PATTERN_RANK = {PATTERN_SPIKE: 0, PATTERN_LATEST: 1, PATTERN_SUSTAINED: 2}
+
 # When too many anomalies are found only the first N are stored, so the order matters:
 # data-integrity problems first, then rule findings, then the statistical (ML) ones.
 _PRIORITY = {
@@ -53,6 +60,7 @@ class Anomaly:
     subject: str | None = None
     term: str | None = None
     score: float | None = None  # the offending score, when there is one
+    pattern: str | None = None  # term jumps only: spike, sustained or latest
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -63,6 +71,7 @@ class Anomaly:
             "term": self.term,
             "score": self.score,
             "severity": self.severity,
+            "pattern": self.pattern,
             "details": self.details,
         }
 
@@ -72,11 +81,12 @@ class Anomaly:
 
 
 def rank_anomalies(anomalies: list[Anomaly]) -> list[Anomaly]:
-    """Most important first: by method priority, then severity, then a stable tie-break."""
+    """Most important first: method, then jump pattern, then severity, then a stable tie-break."""
     return sorted(
         anomalies,
         key=lambda a: (
             _PRIORITY[a.method],
+            _PATTERN_RANK.get(a.pattern, len(_PATTERN_RANK)),  # spikes before lasting changes
             -a.severity,
             a.student_id,
             a.subject or "",
@@ -145,6 +155,10 @@ def detect_term_jumps(
     Only consecutive terms count (T1 to T2, T2 to T3). If a term is missing the pair is
     skipped. If a student has several scores for one subject and term, their mean is used.
     A change of exactly `threshold` is not flagged.
+
+    Each finding also says what happened next (its `pattern`): a spike that went back, a
+    change that held, or a change in the latest term that cannot be judged yet. A genuine
+    breakthrough (40, 75, 78) is "sustained"; a suspicious blip (34, 77, 38) is a "spike".
     """
     if data.empty:
         return []
@@ -157,7 +171,9 @@ def detect_term_jumps(
     for earlier, later in zip(TERM_ORDER, TERM_ORDER[1:], strict=False):
         change = scores[later] - scores[earlier]  # NaN where a term is missing: never flagged
         for (student_id, subject), delta in change[change.abs() > threshold].items():
-            before, after = scores.loc[(student_id, subject), [earlier, later]]
+            series = scores.loc[(student_id, subject)]
+            before, after = series[earlier], series[later]
+            pattern, outlook = _classify_jump(series, earlier, later, threshold)
             anomalies.append(
                 Anomaly(
                     method=AnomalyMethod.TERM_JUMP,
@@ -167,13 +183,46 @@ def detect_term_jumps(
                     term=later,
                     score=float(after),
                     severity=round(abs(float(delta)), 2),
+                    pattern=pattern,
                     details=(
                         f"{subject}: score {'rose' if delta > 0 else 'fell'} from {before:g} "
-                        f"({earlier}) to {after:g} ({later}), a change of {delta:+.1f} points"
+                        f"({earlier}) to {after:g} ({later}), a change of {delta:+.1f} points; "
+                        f"{outlook}"
                     ),
                 )
             )
     return anomalies
+
+
+def _classify_jump(
+    series: pd.Series, earlier: str, later: str, threshold: float
+) -> tuple[str, str]:
+    """(pattern, sentence about what happened next) for one jump in a student's subject scores.
+
+    `series` holds the scores for T1, T2 and T3 (NaN where missing). A jump is a spike if the
+    score went back at least halfway to where it started.
+    """
+    t1, t2, t3 = (series[term] for term in TERM_ORDER)
+    if (earlier, later) == ("T1", "T2"):
+        if pd.isna(t3):
+            return (
+                PATTERN_LATEST,
+                "T2 is the latest term, so it is not yet known whether this lasts",
+            )
+        if abs(t3 - t1) < abs(t2 - t1) / 2:
+            return PATTERN_SPIKE, f"it then moved back to {t3:g} in T3, so this looks like a spike"
+        return PATTERN_SUSTAINED, f"it did not go back in T3 ({t3:g})"
+
+    # T2 to T3: is it the way back from an earlier jump?
+    if not pd.isna(t1):
+        earlier_jump = t2 - t1
+        if (
+            abs(earlier_jump) > threshold
+            and (t3 - t2) * earlier_jump < 0
+            and abs(t3 - t1) < abs(earlier_jump) / 2
+        ):
+            return PATTERN_SPIKE, "this reverses the earlier jump, so it looks like a spike"
+    return PATTERN_LATEST, "T3 is the latest term, so it is not yet known whether this lasts"
 
 
 def detect_duplicate_ids(data: pd.DataFrame) -> list[Anomaly]:
