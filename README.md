@@ -13,22 +13,21 @@ flowchart TD
     raw -->|"upload event"| queue[["SQS queue"]]
     queue -.->|"after 3 failed tries"| dlq[["Dead-letter queue"]]
     queue --> trigger["Trigger Lambda<br/>duplicate check"]
-    trigger -->|"start a run"| workflow["Step Functions workflow<br/>Validate, Clean, Stats, Store"]
+    trigger -->|"start a run"| workflow["Step Functions workflow<br/>Validate, Clean, Stats, Anomalies, Store"]
     trigger <-->|"hash claim"| ddb[("DynamoDB")]
     workflow -->|"stats and status"| ddb
     workflow -->|"Parquet"| processed[("S3 processed bucket")]
     workflow -->|"bad files"| quarantine[("S3 quarantine bucket")]
     workflow -->|"failure alert"| sns["SNS email alert"]
-    workflow -.-> anomalies["Detect anomalies<br/>Phase 5"]:::planned
     ddb -.-> api["API Gateway and Lambda<br/>Phase 6"]:::planned
     api -.-> dashboard["React dashboard<br/>Phase 7"]:::planned
 
     classDef planned stroke-dasharray: 5 5,fill:#f4f4f4,color:#555
 ```
 
-Solid boxes are built and deployed (up to v0.4.0). Dashed boxes are planned in later phases.
+Solid boxes are built and deployed (up to v0.5.0). Dashed boxes are planned in later phases.
 
-## What works today (v0.4.0)
+## What works today (v0.5.0)
 
 ```mermaid
 flowchart TD
@@ -38,7 +37,8 @@ flowchart TD
         validate["Validate"] --> valid{"valid file?"}
         valid -->|"yes"| clean["Clean"]
         clean --> stats["Stats"]
-        stats --> store["Store"]
+        stats --> anomalies["Anomalies<br/>container image"]
+        anomalies --> store["Store"]
     end
 
     store --> done(["Run succeeded<br/>dataset COMPLETED"]):::good
@@ -84,8 +84,10 @@ sequenceDiagram
     L->>P: save processed/ds-1/data.parquet
     W->>L: Stats
     L->>P: read the Parquet file
+    W->>L: Anomalies
+    L->>P: read the Parquet file, save work/ds-1/anomalies.jsonl
     W->>L: Store
-    L->>D: save STATS items, then META as COMPLETED
+    L->>D: save STATS and ANOMALY items, then META as COMPLETED
 ```
 
 Upload a CSV or JSON file to `uploads/<dataset_id>/<filename>`. S3 sends an event to an SQS
@@ -100,7 +102,8 @@ whose steps are separate Lambdas:
 | **Validate** | File-level checks (readable UTF-8, `.csv`/`.json`, rows, required columns) and row-level checks (the rules below). Saves the valid rows. | S3 key of the valid rows, row counts, the first 20 row errors |
 | **Clean** | pandas: trims text, normalises subjects (`maths` → `Maths`, `ict` → `ICT`), casts `year`/`score`, drops exact duplicates. Writes `processed/<id>/data.parquet`. | the Parquet key, cleaned row count |
 | **Stats** | Per subject and term, overall, top 5 / bottom 5 students, class averages. | the statistics as JSON (about 3 KB) |
-| **Store** | Deletes old `STATS#` items, saves the new ones, then writes `META` as `COMPLETED` (last, so completed means everything is there). | final status |
+| **Anomalies** | Rule-based detectors plus an Isolation Forest, in a **container-image Lambda** (see Anomaly detection below). Writes every finding to S3, ranked. | counts per method and the S3 key |
+| **Store** | Deletes old `STATS#` and `ANOMALY#` items, saves the new ones (the most important `MaxAnomalies`), then writes `META` as `COMPLETED` (last, so completed means everything is there). | final status |
 | **Mark failed** | Records `FAILED` with the reason. A bad file is also copied to the quarantine bucket; a crashed run is not (the file may be fine). | |
 
 Steps never pass large data through the workflow (the limit is 256 KB): they hand each other
@@ -143,13 +146,95 @@ Failed runs publish to an SNS topic. Pass your address at deploy time to get an 
 you must click once, and until then nothing is delivered. With no address the topic exists but
 has no subscribers.
 
+### Anomaly detection
+
+After Stats, the **Anomalies** step looks for data that is *suspicious*, not necessarily wrong: it
+flags and explains, and a person decides. Every finding has a reason in words and is stored as an
+`ANOMALY#<rank>` item, **most important first**.
+
+**Rule-based detectors** (predictable and explainable):
+
+| Method | Flags | Setting (default) |
+|---|---|---|
+| `term_jump` | a student's score in one subject changes by more than the threshold between consecutive terms (T1 to T2, T2 to T3). Exactly the threshold is not flagged. | `JumpThreshold` (30 points) |
+| `duplicate_id` | one student ID used with different names | none |
+| `zscore` | a score more than N standard deviations from the mean of its own subject and term. A group of 10 or fewer can never reach 3, so tiny classes are never flagged. | `ZScoreLimit` (3) |
+
+Each term jump carries a **pattern**, because a big change is not always suspicious:
+
+| Pattern | Meaning | Example (T1, T2, T3) |
+|---|---|---|
+| `spike` | went back at least halfway to where it started | 34, 77, 38 (flagged twice: up, then back) |
+| `sustained` | moved and did not go back | 40, 75, 78 (a likely genuine improvement) |
+| `latest` | the change is in the last term, so it cannot be judged yet | 50, 52, 95 |
+
+Spikes rank above lasting changes, even when the lasting change is bigger.
+
+**Machine learning: `isolation_forest`.** Each student is summarised by four numbers: average
+score, spread between their subjects, average change between terms, and their largest single
+change. An Isolation Forest (scikit-learn, 200 trees, fixed random seed so the same file always gives
+the same answer) keeps cutting the data at random: unusual students are isolated after few cuts and
+score high. The most unusual `IfContamination` share (5%) is flagged, each with a reason such as
+*"largest change between consecutive terms 43.0 points is 4.5 standard deviations above the typical
+student (6.0)"*. With fewer than 20 students it is skipped, and META records why (`ml_skipped`).
+
+**Order and storage.** Findings are ranked: `duplicate_id`, then `term_jump` (spike, latest, sustained,
+then by size), then `zscore`, then `isolation_forest`. The most important `MaxAnomalies` (500) are
+stored as `ANOMALY#00001`, `ANOMALY#00002`, ..., and `META` always records the true total
+(`anomaly_count`) next to how many were stored (`anomalies_stored`).
+
+Results for the default sample file (seed 42), as stored in DynamoDB and verified on AWS:
+
+| Rank | Method | Student | Pattern | Severity |
+|---|---|---|---|---|
+| 1 | `duplicate_id` | S00045 | none | 2.0 (two names) |
+| 2 to 5 | `term_jump` | S00040, S00055 (two each) | spike | 46.9, 44.8, 39.1, 34.8 |
+| 6 | `term_jump` | S00034 | sustained (34, 77, 99) | 42.6 |
+| 7 to 9 | `isolation_forest` | S00034, S00055, S00040 | none | 0.739, 0.667, 0.655 |
+
+The three planted score jumps and the planted duplicate ID are all found. There are no `zscore`
+findings: the sample has no extreme single score (the planted out-of-range scores are rejected in
+validation).
+
+**How reliable is it?** Measured on 80 generated files (20 seeds, class sizes 30, 60, 120 and 300),
+each with 3 planted jumps and 1 planted duplicate ID:
+
+| Detector | Planted anomalies found |
+|---|---|
+| Rule-based term jumps | all 3, in **80 of 80** files |
+| Rule-based duplicate ID | the planted one and nothing else, in **80 of 80** files |
+| Isolation Forest, 60 students, 5% | **82% on average**, all three in 11 of 20 files |
+| Isolation Forest, 60 students, 10% | 98%, but only about half of its flags are planted ones |
+| Isolation Forest, 300 students, 5% | 100% (20 of 20) |
+
+The rules are the dependable detectors. The forest is a **second opinion**: it finds students whose
+whole profile is unusual, which includes genuinely weak or erratic students that were not planted,
+so some of its "misses" and "extras" are legitimate.
+
+**Limits to know about**
+- **A flag is a question, not a verdict.** A genuine breakthrough or a bad term (illness) is flagged
+  too. The pattern and the reason help, but a teacher decides.
+- Jumps are measured against the **student's own earlier score, not the class**. If a term's exam
+  was much harder for everyone, many students will be flagged. A class-relative version is not built.
+- The sample data wobbles by only about 6 points a term, so real data will probably produce more
+  flags than the synthetic files do.
+
+**Speed.** On a warm container the whole pipeline took 1.6 seconds for a 904-row file, with
+the Anomalies step at 0.4 s. The **first start after a deploy** is slow: the container image is
+loaded lazily from ECR, the init phase hit Lambda's 10-second limit, and Lambda re-ran it
+inside the invocation. That run took 75 seconds, of which about 47 s was loading libraries and 3 s
+was real work. The step's 300-second timeout (and the state machine's retries) cover this.
+The `joblib will operate in serial mode` warning in its logs is harmless: Lambda has no shared
+memory for it, so it runs single-threaded.
+
 ### DynamoDB items (table `PipelineTable`)
 
 | PK | SK | Content |
 |---|---|---|
-| `DATASET#<id>` | `META` | status, filename, row counts (`total`/`valid`/`invalid`/`clean`), `duplicates_removed`, `row_errors`, `file_hash`, `processed_key`, `quarantine_key`, `duplicate_of`, `error_message` |
+| `DATASET#<id>` | `META` | status, filename, row counts (`total`/`valid`/`invalid`/`clean`), `duplicates_removed`, `row_errors`, `file_hash`, `processed_key`, `quarantine_key`, `duplicate_of`, `anomaly_count`, `anomalies_stored`, `ml_skipped`, `error_message` |
 | `DATASET#<id>` | `STATS#OVERALL` | count, mean, median, std, min, max, pass rate, `student_count`, top 5 / bottom 5 students, class averages |
 | `DATASET#<id>` | `STATS#SUBJECT#<subject>#<term>` | the same metrics for one subject and term |
+| `DATASET#<id>` | `ANOMALY#<rank>` | one finding: `method`, `student_id`, `student_name`, `subject`, `term`, `score`, `pattern`, `severity`, `details` (the reason). Rank 1 is the most important. |
 | `HASH#<sha256>` | `HASH` | `dataset_id` that first uploaded this exact file (duplicate detection) |
 
 Pass rate is the percentage of scores at or above `PassMark` (default 50). All numbers are
@@ -192,8 +277,9 @@ pandas · scikit-learn · pytest · moto · ruff · React + Vite + Recharts · G
 
 ## Local setup
 
-Requirements: Python 3.12, git. For deploying you also need the AWS CLI and SAM CLI (Docker
-is needed later, from Phase 5). See [docs/aws-setup.md](docs/aws-setup.md).
+Requirements: Python 3.12, git. For deploying you also need the AWS CLI and SAM CLI, and
+**Docker Desktop running**: `sam build` builds the container image of the Anomalies step. See
+[docs/aws-setup.md](docs/aws-setup.md).
 
 ```bash
 python3.12 -m venv .venv
@@ -238,7 +324,12 @@ sam build
 sam deploy                    # shows the change set, then asks for confirmation
 ```
 
-Optional parameters, e.g. `sam deploy --parameter-overrides MinValidRatio=0.9 PassMark=40 AlertEmail=you@example.com`.
+Optional parameters, e.g. `sam deploy --parameter-overrides MinValidRatio=0.9 PassMark=40 JumpThreshold=40 AlertEmail=you@example.com`.
+The anomaly settings are `ZScoreLimit`, `JumpThreshold`, `IfContamination` and `MaxAnomalies`.
+
+The first `sam deploy` asks to create an **ECR repository** for the container image (answer `y`),
+then pushes it: about 320 MB compressed, so the first push takes several minutes. Later deploys only
+upload the small code layer. `sam delete` removes the repository.
 
 pandas and pyarrow come from the **AWS SDK for pandas** managed Lambda layer (parameter
 `PandasLayerArn`, default is the `ap-south-1` / Python 3.12 / arm64 layer). In another region,
@@ -258,7 +349,11 @@ BUCKET=$(out RawBucketName); PROCESSED=$(out ProcessedBucketName); QUARANTINE=$(
 TABLE=$(out PipelineTableName); SM=$(out PipelineStateMachineArn); QUEUE=$(out UploadQueueUrl); DLQ=$(out DeadLetterQueueUrl)
 meta() { aws dynamodb get-item --table-name $TABLE --region ap-south-1 \
   --key "{\"PK\":{\"S\":\"DATASET#$1\"},\"SK\":{\"S\":\"META\"}}" \
-  --query "Item.{status:status.S,dup_of:duplicate_of.S,clean:clean_rows.N,quarantine:quarantine_key.S,error:error_message.S}"; }
+  --query "Item.{status:status.S,dup_of:duplicate_of.S,clean:clean_rows.N,anomalies:anomaly_count.N,quarantine:quarantine_key.S,error:error_message.S}"; }
+anomalies() { aws dynamodb query --table-name $TABLE --region ap-south-1 \
+  --key-condition-expression "PK = :pk AND begins_with(SK, :sk)" \
+  --expression-attribute-values "{\":pk\":{\"S\":\"DATASET#$1\"},\":sk\":{\"S\":\"ANOMALY#\"}}" \
+  --query "Items[].[SK.S,method.S,student_id.S,pattern.S,severity.N]" --output table; }
 steps() { aws stepfunctions get-execution-history --execution-arn "$1" --region ap-south-1 \
   --query "events[?contains(type, 'StateEntered')].stateEnteredEventDetails.name" --output text; }
 last_execution() { aws stepfunctions list-executions --state-machine-arn $SM --region ap-south-1 \
@@ -340,8 +435,24 @@ aws sqs get-queue-attributes --queue-url $DLQ --region ap-south-1 \
 aws sqs purge-queue --queue-url $DLQ --region ap-south-1
 ```
 
+**6. Anomalies.** The planted anomalies do not depend on the year, so `--year 2024` gives a file with
+the same findings but **new bytes** (the same bytes as an earlier upload would be a duplicate). The
+first run after a deploy is slow (see Speed above), so wait longer:
+
+```bash
+python scripts/generate_sample_data.py --seed 42 --year 2024 --out data/sample_anoms.csv
+aws s3 cp data/sample_anoms.csv s3://$BUCKET/uploads/demo-5/sample_anoms.csv
+sleep 75
+meta demo-5
+steps $(last_execution)
+anomalies demo-5
+```
+
+Expect `COMPLETED`, 9 anomalies, steps `Validate IsValid Clean Stats Anomalies Store`, and the nine
+rows from the results table above, in that order.
+
 Lambda logs: `sam logs -n ValidateFunction --stack-name gradeflow --region ap-south-1 --tail`
-(use `TriggerFunction`, `CleanFunction`, `StatsFunction`, `StoreFunction` or `FailFunction`).
+(use `TriggerFunction`, `CleanFunction`, `StatsFunction`, `AnomaliesFunction`, `StoreFunction` or `FailFunction`).
 
 ### Clean up
 
@@ -359,7 +470,9 @@ sam delete --stack-name gradeflow --region ap-south-1
 At portfolio-demo volume this stays within the AWS Free Tier:
 
 - Lambda runs on arm64. Memory is sized per step (see Limits): 512 MB Trigger, 2048 MB
-  Validate and Clean, 1024 MB Stats, 256 MB Store and Fail. Lambda bills memory times time:
+  Validate, Clean and Anomalies, 1024 MB Stats, 256 MB Store and Fail.
+- ECR stores the container image: 322 MB compressed. The Free Tier covers 500 MB for the first 12
+  months on a new account; after that it is roughly $0.03 a month. Lambda bills memory times time:
   the 25 MB test file used about 30 GB-seconds in total, against a free tier of 400,000
   GB-seconds a month (roughly 13,000 uploads of that size; typical small files use 1 or 2).
 - Step Functions: about 10 state transitions per run, against a free tier of 4,000 a month.
@@ -383,6 +496,10 @@ memory figures.
 | Clean | 2048 MB | 885 MB |
 | Stats | 1024 MB | 364 MB |
 
+The **Anomalies** container (2048 MB, 300 s timeout) used 374 to 379 MB on 904-row files. It has not
+been measured on the 25 MB file, so its large-file memory is an estimate (it loads the cleaned data
+as a DataFrame, as Stats does, plus the forest).
+
 Extrapolating the same figures, a 50 MB file (about a million rows) should need roughly 1.5 to
 1.6 GB in Clean, which fits in 2048 MB. **That size has not been run**: 25 MB is the largest file
 verified. Files much beyond 50 MB would need chunked processing, AWS Glue or Fargate, which are
@@ -395,7 +512,7 @@ out of scope for this project. Each Lambda also has a 15-minute ceiling (these u
 - [x] Phase 2: Cleaning & statistics (`v0.2.0`)
 - [x] Phase 3: Reliability: SQS, DLQ, idempotency, quarantine (`v0.3.0`)
 - [x] Phase 4: Orchestration with Step Functions (`v0.4.0`)
-- [ ] Phase 5: Anomaly detection, rule-based + Isolation Forest (`v0.5.0`)
+- [x] Phase 5: Anomaly detection, rule-based + Isolation Forest (`v0.5.0`)
 - [ ] Phase 6: Analytics API (`v0.6.0`)
 - [ ] Phase 7: Dashboard (`v0.7.0`)
 - [ ] Phase 8: Observability & security (`v0.8.0`)
