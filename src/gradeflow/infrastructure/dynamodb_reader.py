@@ -14,7 +14,7 @@ from boto3.dynamodb.conditions import Attr, Key
 
 from gradeflow.application.queries import BadRequest
 from gradeflow.application.read_ports import Page, StatsRecords
-from gradeflow.infrastructure.dynamodb_repository import DATASETS_GSI_PK, dataset_pk
+from gradeflow.infrastructure.table_keys import DATASETS_GSI_PK, dataset_pk
 
 INTERNAL_KEYS = frozenset({"PK", "SK", "GSI1PK", "GSI1SK"})  # table plumbing, not data
 INDEX_KEY_NAMES = ("PK", "SK", "GSI1PK", "GSI1SK")
