@@ -9,6 +9,9 @@ import pytest
 from scripts.generate_sample_data import inject_problems, make_clean_rows, make_students
 
 from gradeflow.domain.anomalies import (
+    PATTERN_LATEST,
+    PATTERN_SPIKE,
+    PATTERN_SUSTAINED,
     Anomaly,
     AnomalyMethod,
     detect_duplicate_ids,
@@ -118,9 +121,11 @@ def test_a_rise_of_more_than_the_threshold_is_flagged() -> None:
     assert (anomaly.student_id, anomaly.student_name) == ("S00001", "Amal Perera")
     assert (anomaly.subject, anomaly.term, anomaly.score) == ("Maths", "T2", 77.0)
     assert anomaly.severity == 42.5
-    assert (
-        anomaly.details == "Maths: score rose from 34.5 (T1) to 77 (T2), a change of +42.5 points"
+    assert anomaly.details == (
+        "Maths: score rose from 34.5 (T1) to 77 (T2), a change of +42.5 points; "
+        "T2 is the latest term, so it is not yet known whether this lasts"
     )
+    assert anomaly.pattern == PATTERN_LATEST  # only two terms: nothing to compare against
 
 
 def test_a_fall_is_flagged_too() -> None:
@@ -162,6 +167,82 @@ def test_jump_threshold_is_configurable() -> None:
 
 def test_term_jumps_on_empty_data() -> None:
     assert detect_term_jumps(frame()) == []
+
+
+# --- what happened after a jump: spike, sustained or latest --------------------------
+
+
+def patterns(*scores: float, **kwargs: float) -> list[tuple[str, str, float]]:
+    """(term, pattern, severity) of every jump for one student's Maths scores."""
+    terms = ("T1", "T2", "T3")
+    rows = [
+        ("S00001", "Amal", "Maths", term, value) for term, value in zip(terms, scores, strict=False)
+    ]
+    return [(a.term, a.pattern, a.severity) for a in detect_term_jumps(frame(*rows), **kwargs)]
+
+
+def test_a_breakthrough_that_stays_is_sustained() -> None:
+    [(term, pattern, _)] = patterns(40, 75, 78)
+    assert (term, pattern) == ("T2", PATTERN_SUSTAINED)
+
+
+def test_a_rise_that_keeps_climbing_is_sustained_too() -> None:
+    assert [p for _, p, _ in patterns(34, 77, 99)] == [PATTERN_SUSTAINED]
+
+
+def test_a_spike_that_goes_back_is_flagged_on_both_sides() -> None:
+    assert patterns(34, 77, 38) == [("T2", PATTERN_SPIKE, 43.0), ("T3", PATTERN_SPIKE, 39.0)]
+
+
+def test_a_bad_term_that_recovers_is_a_spike_in_the_other_direction() -> None:
+    [(term, pattern, _)] = patterns(70, 38, 68)  # the recovery of +30 is exactly the threshold
+    assert (term, pattern) == ("T2", PATTERN_SPIKE)
+
+
+def test_a_jump_in_the_latest_term_cannot_be_judged_yet() -> None:
+    assert patterns(50, 52, 95) == [("T3", PATTERN_LATEST, 43.0)]
+
+
+def test_a_jump_with_no_following_term_is_latest() -> None:
+    assert [p for _, p, _ in patterns(34, 77)] == [PATTERN_LATEST]
+
+
+def test_the_score_must_go_back_at_least_halfway_to_count_as_a_spike() -> None:
+    """T1=30 and T2=80 is a change of 50, so half is 25: T3 must end within 25 of T1."""
+    assert patterns(30, 80, 54)[0][1] == PATTERN_SPIKE  # 24 away from T1
+    assert patterns(30, 80, 56)[0][1] == PATTERN_SUSTAINED  # 26 away from T1
+
+
+def test_a_fall_that_goes_on_falling_is_sustained() -> None:
+    assert patterns(80, 40, 35)[0][1] == PATTERN_SUSTAINED
+
+
+def test_the_reason_says_what_happened_next() -> None:
+    reasons = {a.term: a.details for a in detect_term_jumps(frame(*jump_rows(34.0, 77.0, 38.0)))}
+    assert reasons["T2"].endswith("it then moved back to 38 in T3, so this looks like a spike")
+    assert reasons["T3"].endswith("this reverses the earlier jump, so it looks like a spike")
+    held = detect_term_jumps(frame(*jump_rows(40.0, 75.0, 78.0)))[0]
+    assert held.details.endswith("it did not go back in T3 (78)")
+
+
+def test_spikes_rank_above_lasting_changes_even_when_smaller() -> None:
+    """A suspicious blip of 35 points matters more than a lasting change of 45 points."""
+    sustained = Anomaly(AnomalyMethod.TERM_JUMP, "S00001", 45.0, "x", pattern=PATTERN_SUSTAINED)
+    latest = Anomaly(AnomalyMethod.TERM_JUMP, "S00002", 40.0, "x", pattern=PATTERN_LATEST)
+    spike = Anomaly(AnomalyMethod.TERM_JUMP, "S00003", 35.0, "x", pattern=PATTERN_SPIKE)
+    assert rank_anomalies([sustained, latest, spike]) == [spike, latest, sustained]
+
+
+def test_within_a_pattern_the_bigger_change_ranks_first() -> None:
+    small = Anomaly(AnomalyMethod.TERM_JUMP, "S00001", 31.0, "x", pattern=PATTERN_SPIKE)
+    big = Anomaly(AnomalyMethod.TERM_JUMP, "S00002", 50.0, "x", pattern=PATTERN_SPIKE)
+    assert rank_anomalies([small, big]) == [big, small]
+
+
+def test_other_methods_ignore_the_pattern_in_ranking() -> None:
+    zscore = Anomaly(AnomalyMethod.ZSCORE, "S00001", 5.0, "x")
+    zscore_big = Anomaly(AnomalyMethod.ZSCORE, "S00002", 9.0, "x")
+    assert rank_anomalies([zscore, zscore_big]) == [zscore_big, zscore]
 
 
 # --- duplicate IDs -------------------------------------------------------------------
@@ -245,6 +326,7 @@ def test_anomaly_survives_a_json_round_trip() -> None:
         term="T2",
         score=77.0,
         severity=42.5,
+        pattern=PATTERN_SPIKE,
         details="Maths: score rose",
     )
     assert Anomaly.from_dict(json.loads(json.dumps(original.to_dict()))) == original
@@ -297,3 +379,26 @@ def test_sample_has_no_zscore_outliers(sample: pd.DataFrame) -> None:
 def test_sample_rule_based_summary(sample: pd.DataFrame) -> None:
     result = detect_rule_based(sample)
     assert [a.method.value for a in result] == ["duplicate_id"] + ["term_jump"] * 5
+
+
+def test_sample_patterns_two_spikes_and_one_climb(sample: pd.DataFrame) -> None:
+    """S00040 and S00055 rose then fell back (spikes); S00034 went 34 -> 77 -> 99 (sustained)."""
+    by_student = {}
+    for a in detect_term_jumps(sample):
+        by_student.setdefault(a.student_id, set()).add(a.pattern)
+    assert by_student == {
+        "S00034": {PATTERN_SUSTAINED},
+        "S00040": {PATTERN_SPIKE},
+        "S00055": {PATTERN_SPIKE},
+    }
+
+
+def test_sample_ranking_puts_the_spikes_before_the_climb(sample: pd.DataFrame) -> None:
+    jumps = [a for a in detect_rule_based(sample) if a.method == AnomalyMethod.TERM_JUMP]
+    assert [(a.student_id, a.pattern) for a in jumps] == [
+        ("S00040", PATTERN_SPIKE),
+        ("S00055", PATTERN_SPIKE),
+        ("S00040", PATTERN_SPIKE),
+        ("S00055", PATTERN_SPIKE),
+        ("S00034", PATTERN_SUSTAINED),
+    ]
