@@ -7,6 +7,7 @@ import boto3
 from boto3.dynamodb.conditions import Key
 from botocore.exceptions import ClientError
 
+from gradeflow.domain.anomalies import Anomaly
 from gradeflow.domain.dataset import DatasetMeta
 from gradeflow.domain.statistics import DatasetStats, ScoreSummary, StudentAverage
 
@@ -19,6 +20,14 @@ def dataset_pk(dataset_id: str) -> str:
 
 def hash_pk(sha256: str) -> str:
     return f"HASH#{sha256}"
+
+
+MAX_ANOMALY_RECORDS = 99_999  # the numbering in the sort key has five digits
+
+
+def anomaly_sk(rank: int) -> str:
+    """ANOMALY#00001 for the most important finding. Zero-padded so sort order = rank."""
+    return f"ANOMALY#{rank:05d}"
 
 
 class DynamoDbDatasetRepository:
@@ -47,9 +56,24 @@ class DynamoDbDatasetRepository:
 
     def delete_stats(self, dataset_id: str) -> None:
         """Delete every STATS# item of the dataset (META and other datasets are untouched)."""
+        self._delete_with_prefix(dataset_id, "STATS#")
+
+    def save_anomalies(self, dataset_id: str, anomalies: list[Anomaly]) -> None:
+        """Write ANOMALY#00001, ANOMALY#00002, ... in the order given (most important first)."""
+        if len(anomalies) > MAX_ANOMALY_RECORDS:
+            raise ValueError(f"cannot store more than {MAX_ANOMALY_RECORDS} anomalies")
+        with self._table.batch_writer() as batch:
+            for rank, anomaly in enumerate(anomalies, start=1):
+                batch.put_item(Item=to_anomaly_item(dataset_id, rank, anomaly))
+
+    def delete_anomalies(self, dataset_id: str) -> None:
+        """Delete every ANOMALY# item of the dataset (META, STATS and other datasets stay)."""
+        self._delete_with_prefix(dataset_id, "ANOMALY#")
+
+    def _delete_with_prefix(self, dataset_id: str, sort_key_prefix: str) -> None:
         query = {
             "KeyConditionExpression": Key("PK").eq(dataset_pk(dataset_id))
-            & Key("SK").begins_with("STATS#"),
+            & Key("SK").begins_with(sort_key_prefix),
             "ProjectionExpression": "PK, SK",
         }
         with self._table.batch_writer() as batch:
@@ -100,6 +124,8 @@ def to_meta_item(meta: DatasetMeta) -> dict[str, Any]:
         "row_errors": list(meta.row_errors),
         "clean_rows": meta.clean_rows,
         "duplicates_removed": meta.duplicates_removed,
+        "anomaly_count": meta.anomaly_count,
+        "anomalies_stored": meta.anomalies_stored,
     }
     if meta.processed_key is not None:
         item["processed_key"] = meta.processed_key
@@ -107,7 +133,30 @@ def to_meta_item(meta: DatasetMeta) -> dict[str, Any]:
         "file_hash": meta.file_hash,
         "duplicate_of": meta.duplicate_of,
         "quarantine_key": meta.quarantine_key,
+        "ml_skipped": meta.ml_skipped,
         "error_message": meta.error_message,
+    }
+    item.update({name: value for name, value in optional.items() if value is not None})
+    return item
+
+
+def to_anomaly_item(dataset_id: str, rank: int, anomaly: Anomaly) -> dict[str, Any]:
+    """Map one finding to a DynamoDB item. Missing (None) fields are left out."""
+    item: dict[str, Any] = {
+        "PK": dataset_pk(dataset_id),
+        "SK": anomaly_sk(rank),
+        "rank": rank,
+        "method": anomaly.method.value,
+        "student_id": anomaly.student_id,
+        "severity": _decimal(anomaly.severity),
+        "details": anomaly.details,
+    }
+    optional = {
+        "student_name": anomaly.student_name,
+        "subject": anomaly.subject,
+        "term": anomaly.term,
+        "pattern": anomaly.pattern,
+        "score": None if anomaly.score is None else _decimal(anomaly.score),
     }
     item.update({name: value for name, value in optional.items() if value is not None})
     return item
