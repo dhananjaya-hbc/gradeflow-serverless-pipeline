@@ -2,6 +2,7 @@
 pytest==8.4.2
 ruff==0.13.2
 pandas==2.3.2
+scikit-learn==1.9.1  # Isolation Forest; the container Lambda installs the same version
 pyarrow==25.0.1  # Parquet engine; Lambda gets it from the AWS SDK for pandas layer (3.17.1)
 boto3==1.40.39
 pyyaml==6.0.3  # tests read template.yaml
