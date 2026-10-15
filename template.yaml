@@ -2,9 +2,9 @@ AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
 Description: >
   GradeFlow - serverless data pipeline for education analytics.
-  Phase 4: S3 upload -> SQS (+DLQ) -> trigger Lambda (skips duplicates) -> Step Functions
-  (validate, clean, stats, store; failure branch quarantines, records FAILED and alerts)
-  -> Parquet in S3 + DynamoDB.
+  Phase 5: S3 upload -> SQS (+DLQ) -> trigger Lambda (skips duplicates) -> Step Functions
+  (validate, clean, stats, anomalies, store; failure branch quarantines, records FAILED and
+  alerts) -> Parquet in S3 + DynamoDB. The anomalies step runs from a container image.
 
 Parameters:
   MinValidRatio:
@@ -19,6 +19,30 @@ Parameters:
     MinValue: 0
     MaxValue: 100
     Description: Scores at or above this count as a pass (0-100).
+  ZScoreLimit:
+    Type: Number
+    Default: 3
+    MinValue: 0.5
+    MaxValue: 10
+    Description: A score this many standard deviations from its subject and term is an anomaly.
+  JumpThreshold:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    MaxValue: 100
+    Description: A change of more than this many points between consecutive terms is flagged.
+  IfContamination:
+    Type: Number
+    Default: 0.05
+    MinValue: 0.001
+    MaxValue: 0.5
+    Description: Share of students the Isolation Forest flags as unusual (0.05 = about 5%).
+  MaxAnomalies:
+    Type: Number
+    Default: 500
+    MinValue: 1
+    MaxValue: 10000
+    Description: Most findings stored per dataset (the true total is always recorded).
   PandasLayerArn:
     Type: String
     # AWS SDK for pandas 3.17.1 (pandas, numpy, pyarrow), published by AWS for
@@ -39,14 +63,12 @@ Conditions:
   HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
 
 Globals:
+  # Only settings valid for BOTH zip and container-image functions. Runtime, CodeUri and Layers
+  # are not allowed on an image function, so each zip function sets them itself.
   Function:
-    Runtime: python3.12
     Architectures: [arm64] # Graviton: ~20% cheaper than x86 for the same work
     MemorySize: 256
     Timeout: 60
-    CodeUri: src/ # every zip Lambda shares the gradeflow package
-    Layers:
-      - !Ref PandasLayerArn # gradeflow.application imports pandas, so every function needs it
 
 Resources:
   # --- Storage ---------------------------------------------------------------------
@@ -211,6 +233,7 @@ Resources:
         ValidateFunctionArn: !GetAtt ValidateFunction.Arn
         CleanFunctionArn: !GetAtt CleanFunction.Arn
         StatsFunctionArn: !GetAtt StatsFunction.Arn
+        AnomaliesFunctionArn: !GetAtt AnomaliesFunction.Arn
         StoreFunctionArn: !GetAtt StoreFunction.Arn
         FailFunctionArn: !GetAtt FailFunction.Arn
         AlertTopicArn: !Ref AlertTopic
@@ -221,6 +244,8 @@ Resources:
             FunctionName: !Ref CleanFunction
         - LambdaInvokePolicy:
             FunctionName: !Ref StatsFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref AnomaliesFunction
         - LambdaInvokePolicy:
             FunctionName: !Ref StoreFunction
         - LambdaInvokePolicy:
@@ -235,6 +260,10 @@ Resources:
     Properties:
       Description: Reads each upload from SQS, skips duplicate files, starts the workflow.
       Handler: gradeflow.entrypoints.trigger_handler.handler
+      Runtime: python3.12
+      CodeUri: src/ # every zip Lambda shares the gradeflow package
+      Layers:
+        - !Ref PandasLayerArn # gradeflow.application imports pandas, so every function needs it
       MemorySize: 512 # holds the whole file in memory to fingerprint it (209 MB used at idle)
       Timeout: 30
       Environment:
@@ -264,6 +293,10 @@ Resources:
     Properties:
       Description: Workflow step 1, parses and validates the file, saves the valid rows.
       Handler: gradeflow.entrypoints.validate_handler.handler
+      Runtime: python3.12
+      CodeUri: src/ # every zip Lambda shares the gradeflow package
+      Layers:
+        - !Ref PandasLayerArn # gradeflow.application imports pandas, so every function needs it
       # The whole file is parsed into Python dicts. Measured about 1.4 MB per 1,000 rows
       # (a 50 MB CSV is roughly a million rows), on top of ~200 MB for the runtime and pandas.
       # Memory also scales CPU, so big files run faster, and the cost stays tiny.
@@ -284,6 +317,10 @@ Resources:
     Properties:
       Description: Workflow step 2, cleans the valid rows and writes the Parquet file.
       Handler: gradeflow.entrypoints.clean_handler.handler
+      Runtime: python3.12
+      CodeUri: src/ # every zip Lambda shares the gradeflow package
+      Layers:
+        - !Ref PandasLayerArn # gradeflow.application imports pandas, so every function needs it
       MemorySize: 2048 # rows as dicts plus a DataFrame at the same time: the peak of the pipeline
       Timeout: 120
       Environment:
@@ -300,6 +337,10 @@ Resources:
     Properties:
       Description: Workflow step 3, computes statistics from the cleaned data.
       Handler: gradeflow.entrypoints.stats_handler.handler
+      Runtime: python3.12
+      CodeUri: src/ # every zip Lambda shares the gradeflow package
+      Layers:
+        - !Ref PandasLayerArn # gradeflow.application imports pandas, so every function needs it
       MemorySize: 1024 # a DataFrame of the clean rows
       Timeout: 120
       Environment:
@@ -310,29 +351,71 @@ Resources:
         - S3ReadPolicy:
             BucketName: !Ref ProcessedBucket
 
+  AnomaliesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Workflow step 4, finds anomalies with rules and an Isolation Forest.
+      # scikit-learn is too big for a zip Lambda, so this one runs from a container image.
+      # sam build builds it from docker/anomalies/Dockerfile; sam deploy pushes it to ECR.
+      PackageType: Image
+      ImageConfig:
+        Command:
+          - gradeflow.entrypoints.anomalies_handler.handler
+      MemorySize: 2048 # the cleaned data as a DataFrame plus the forest (peaks near 1 GB at 525,000 rows)
+      Timeout: 300
+      Environment:
+        Variables:
+          PROCESSED_BUCKET: !Ref ProcessedBucket
+          ZSCORE_LIMIT: !Ref ZScoreLimit
+          JUMP_THRESHOLD: !Ref JumpThreshold
+          IF_CONTAMINATION: !Ref IfContamination
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref ProcessedBucket
+        - S3WritePolicy:
+            BucketName: !Ref ProcessedBucket
+    Metadata:
+      Dockerfile: docker/anomalies/Dockerfile
+      DockerContext: . # the repository root, so the Dockerfile can COPY src/gradeflow
+      DockerTag: python3.12
+
   StoreFunction:
     Type: AWS::Serverless::Function
     Properties:
       Description: Workflow step 4, saves statistics and marks the dataset COMPLETED.
       Handler: gradeflow.entrypoints.store_handler.handler
+      Runtime: python3.12
+      CodeUri: src/ # every zip Lambda shares the gradeflow package
+      Layers:
+        - !Ref PandasLayerArn # gradeflow.application imports pandas, so every function needs it
       Environment:
         Variables:
           TABLE_NAME: !Ref PipelineTable
+          PROCESSED_BUCKET: !Ref ProcessedBucket
+          MAX_ANOMALIES: !Ref MaxAnomalies
       Policies:
         - Statement:
             - Effect: Allow
               Action:
                 - dynamodb:PutItem # META
-                - dynamodb:Query # find the old STATS# items
-                - dynamodb:DeleteItem # delete the old STATS# items
-                - dynamodb:BatchWriteItem # batch_writer for stats puts and deletes
+                - dynamodb:Query # find the old STATS# and ANOMALY# items
+                - dynamodb:DeleteItem # delete the old STATS# and ANOMALY# items
+                - dynamodb:BatchWriteItem # batch_writer for stats and anomaly puts and deletes
               Resource: !GetAtt PipelineTable.Arn
+        - Statement:
+            - Effect: Allow
+              Action: s3:GetObject # the anomalies file only, nothing else in the bucket
+              Resource: !Sub "${ProcessedBucket.Arn}/work/*"
 
   FailFunction:
     Type: AWS::Serverless::Function
     Properties:
       Description: Failure branch, quarantines a bad file and marks the dataset FAILED.
       Handler: gradeflow.entrypoints.fail_handler.handler
+      Runtime: python3.12
+      CodeUri: src/ # every zip Lambda shares the gradeflow package
+      Layers:
+        - !Ref PandasLayerArn # gradeflow.application imports pandas, so every function needs it
       Environment:
         Variables:
           TABLE_NAME: !Ref PipelineTable
@@ -368,6 +451,11 @@ Resources:
     Type: AWS::Logs::LogGroup
     Properties:
       LogGroupName: !Sub "/aws/lambda/${StatsFunction}"
+      RetentionInDays: 14
+  AnomaliesFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AnomaliesFunction}"
       RetentionInDays: 14
   StoreFunctionLogGroup:
     Type: AWS::Logs::LogGroup
@@ -405,6 +493,9 @@ Outputs:
   AlertTopicArn:
     Description: Failure alerts are published here
     Value: !Ref AlertTopic
+  AnomaliesFunctionName:
+    Description: Anomalies Lambda, a container image (check its logs in CloudWatch)
+    Value: !Ref AnomaliesFunction
   TriggerFunctionName:
     Description: Trigger Lambda (reads the queue; check its logs in CloudWatch)
     Value: !Ref TriggerFunction
