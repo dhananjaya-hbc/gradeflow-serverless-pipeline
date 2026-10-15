@@ -183,7 +183,11 @@ def test_handlers_fail_loudly_when_an_earlier_section_is_missing() -> None:
 
     state["cleaning"] = over_json(clean_handler.process(state, CleanStep(stack.artifacts)))
     with pytest.raises(ValueError, match="stats"):
-        store_handler.process(state, StoreStep(stack.repository))
+        store_handler.process(state, StoreStep(stack.repository, stack.artifacts))
+
+    state["stats"] = over_json(stats_handler.process(state, StatsStep(stack.artifacts, 50)))
+    with pytest.raises(ValueError, match="anomalies"):
+        store_handler.process(state, StoreStep(stack.repository, stack.artifacts))
 
     # the failed attempts changed nothing: the dataset is still PROCESSING
     assert stack.repository.current["ds-1"].status == DatasetStatus.PROCESSING
