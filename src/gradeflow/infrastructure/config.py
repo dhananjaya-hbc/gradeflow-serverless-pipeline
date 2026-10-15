@@ -52,6 +52,13 @@ class AnomaliesConfig:
 
 
 @dataclass(frozen=True)
+class ApiConfig:
+    table_name: str
+    raw_bucket: str  # uploads are signed for this bucket
+    allowed_origin: str  # sent as Access-Control-Allow-Origin on every response
+
+
+@dataclass(frozen=True)
 class StoreConfig:
     table_name: str
     processed_bucket: str  # where the anomalies file is read from
@@ -99,6 +106,15 @@ def load_anomalies_config(env: Mapping[str, str] | None = None) -> AnomaliesConf
         zscore_limit=_number(env, "ZSCORE_LIMIT", DEFAULT_ZSCORE_LIMIT, 0.5, 10.0),
         jump_threshold=_number(env, "JUMP_THRESHOLD", DEFAULT_JUMP_THRESHOLD, 1.0, 100.0),
         contamination=_number(env, "IF_CONTAMINATION", DEFAULT_CONTAMINATION, 0.001, 0.5),
+    )
+
+
+def load_api_config(env: Mapping[str, str] | None = None) -> ApiConfig:
+    env = _env(env)
+    return ApiConfig(
+        table_name=_required(env, "TABLE_NAME"),
+        raw_bucket=_required(env, "RAW_BUCKET"),
+        allowed_origin=env.get("ALLOWED_ORIGIN", "").strip() or "*",
     )
 
 
