@@ -11,6 +11,7 @@ from boto3.dynamodb.conditions import Key
 from botocore.exceptions import ClientError
 from moto import mock_aws
 
+from gradeflow.domain.anomalies import Anomaly, AnomalyMethod
 from gradeflow.domain.dataset import DatasetMeta, DatasetStatus
 from gradeflow.domain.statistics import (
     DatasetStats,
@@ -18,7 +19,11 @@ from gradeflow.domain.statistics import (
     StudentAverage,
     SubjectTermStats,
 )
-from gradeflow.infrastructure.dynamodb_repository import DynamoDbDatasetRepository
+from gradeflow.infrastructure.dynamodb_repository import (
+    MAX_ANOMALY_RECORDS,
+    DynamoDbDatasetRepository,
+    anomaly_sk,
+)
 from gradeflow.infrastructure.s3_artifacts import S3DatasetArtifacts
 from gradeflow.infrastructure.s3_quarantine import S3Quarantine
 from gradeflow.infrastructure.s3_storage import S3FileStorage
@@ -121,6 +126,8 @@ def test_save_meta_writes_item(table) -> None:
         "row_errors": ["row 10: score '150' must be a number 0-100"],
         "clean_rows": 0,
         "duplicates_removed": 0,
+        "anomaly_count": 0,
+        "anomalies_stored": 0,
     }
 
 
@@ -521,3 +528,190 @@ def test_quarantine_missing_source_raises() -> None:
 
     with pytest.raises(s3.exceptions.NoSuchKey):
         S3Quarantine("quarantine").quarantine("raw", "uploads/ds-1/missing.csv", "ds-1")
+
+
+# --- anomalies: S3 file ----------------------------------------------------------------
+
+
+def make_anomaly(rank: int = 1, **overrides: object) -> Anomaly:
+    fields = {
+        "method": AnomalyMethod.TERM_JUMP,
+        "student_id": f"S{rank:05d}",
+        "student_name": "Amal Perera",
+        "subject": "Maths",
+        "term": "T2",
+        "score": 77.0,
+        "severity": 42.6,
+        "pattern": "spike",
+        "details": "Maths: score rose from 34.4 (T1) to 77 (T2)",
+        **overrides,
+    }
+    return Anomaly(**fields)
+
+
+def test_anomalies_round_trip_through_s3_in_order(processed_bucket) -> None:
+    artifacts = S3DatasetArtifacts("processed")
+    anomalies = [
+        make_anomaly(
+            1,
+            method=AnomalyMethod.DUPLICATE_ID,
+            subject=None,
+            term=None,
+            score=None,
+            pattern=None,
+            student_name=None,
+            details="ID used with 2 names: 'A', 'B'",
+        ),  # fmt: skip
+        make_anomaly(2),
+        make_anomaly(
+            3,
+            method=AnomalyMethod.ISOLATION_FOREST,
+            subject=None,
+            term=None,
+            score=None,
+            pattern=None,
+            severity=0.739,
+            details="Ruwan \u0dc1\u0dca\u0dbb\u0dd3: unusual",
+        ),  # fmt: skip
+    ]
+
+    key = artifacts.save_anomalies("ds-1", anomalies)
+
+    assert key == "work/ds-1/anomalies.jsonl"
+    body = processed_bucket.get_object(Bucket="processed", Key=key)["Body"].read().decode()
+    assert len(body.splitlines()) == 3  # one JSON object per line
+    assert artifacts.load_anomalies(key) == anomalies  # same order, None fields, unicode intact
+
+
+def test_no_anomalies_round_trip_as_an_empty_file(processed_bucket) -> None:
+    artifacts = S3DatasetArtifacts("processed")
+    key = artifacts.save_anomalies("ds-1", [])
+    assert artifacts.load_anomalies(key) == []
+
+
+# --- anomalies: DynamoDB ---------------------------------------------------------------
+
+
+def test_anomaly_sort_keys_are_zero_padded_so_they_sort_by_rank() -> None:
+    assert anomaly_sk(1) == "ANOMALY#00001"
+    assert anomaly_sk(10) == "ANOMALY#00010"
+    assert sorted(anomaly_sk(n) for n in (10, 2, 1, 100)) == [
+        anomaly_sk(n) for n in (1, 2, 10, 100)
+    ]
+
+
+def test_save_anomalies_writes_one_item_per_finding(table) -> None:
+    DynamoDbDatasetRepository(TABLE).save_anomalies("ds-1", [make_anomaly(1)])
+
+    item = table.get_item(Key={"PK": "DATASET#ds-1", "SK": "ANOMALY#00001"})["Item"]
+    assert item == {
+        "PK": "DATASET#ds-1",
+        "SK": "ANOMALY#00001",
+        "rank": 1,
+        "method": "term_jump",
+        "student_id": "S00001",
+        "student_name": "Amal Perera",
+        "subject": "Maths",
+        "term": "T2",
+        "pattern": "spike",
+        "score": Decimal("77.0"),
+        "severity": Decimal("42.6"),
+        "details": "Maths: score rose from 34.4 (T1) to 77 (T2)",
+    }
+
+
+def test_missing_fields_are_left_out_of_the_item(table) -> None:
+    duplicate = make_anomaly(
+        1, method=AnomalyMethod.DUPLICATE_ID, student_name=None, subject=None, term=None,
+        score=None, pattern=None, severity=2.0,
+    )  # fmt: skip
+    DynamoDbDatasetRepository(TABLE).save_anomalies("ds-1", [duplicate])
+
+    item = table.get_item(Key={"PK": "DATASET#ds-1", "SK": "ANOMALY#00001"})["Item"]
+    assert set(item) == {"PK", "SK", "rank", "method", "student_id", "severity", "details"}
+
+
+def test_a_query_returns_the_most_important_finding_first(table) -> None:
+    repository = DynamoDbDatasetRepository(TABLE)
+    repository.save_meta(make_meta("ds-1"))
+    repository.save_anomalies(
+        "ds-1", [make_anomaly(rank, severity=100.0 - rank) for rank in range(1, 13)]
+    )
+
+    items = table.query(
+        KeyConditionExpression=Key("PK").eq("DATASET#ds-1") & Key("SK").begins_with("ANOMALY#")
+    )["Items"]
+
+    assert [item["rank"] for item in items] == list(range(1, 13))  # 10, 11, 12 after 9, not after 1
+    assert [item["student_id"] for item in items][:2] == ["S00001", "S00002"]
+
+
+def test_save_anomalies_handles_more_than_one_batch(table) -> None:
+    DynamoDbDatasetRepository(TABLE).save_anomalies("ds-1", [make_anomaly(n) for n in range(1, 61)])
+    assert table.query(KeyConditionExpression=Key("PK").eq("DATASET#ds-1"))["Count"] == 60
+
+
+def test_delete_anomalies_removes_only_anomaly_items(table) -> None:
+    repository = DynamoDbDatasetRepository(TABLE)
+    for dataset in ("ds-1", "ds-2"):
+        repository.save_meta(make_meta(dataset))
+        repository.save_stats(dataset, make_stats())
+        repository.save_anomalies(dataset, [make_anomaly(1), make_anomaly(2)])
+
+    repository.delete_anomalies("ds-1")
+
+    ds1 = {
+        item["SK"]
+        for item in table.query(KeyConditionExpression=Key("PK").eq("DATASET#ds-1"))["Items"]
+    }
+    ds2 = table.query(KeyConditionExpression=Key("PK").eq("DATASET#ds-2"))["Items"]
+    assert ds1 == {
+        "META",
+        "STATS#OVERALL",
+        "STATS#SUBJECT#Maths#T1",
+        "STATS#SUBJECT#Social Studies#T2",
+    }
+    assert len(ds2) == 6  # META, 3 stats items and both anomalies untouched
+
+
+def test_delete_stats_leaves_the_anomalies_alone(table) -> None:
+    repository = DynamoDbDatasetRepository(TABLE)
+    repository.save_stats("ds-1", make_stats())
+    repository.save_anomalies("ds-1", [make_anomaly(1)])
+
+    repository.delete_stats("ds-1")
+
+    remaining = table.query(KeyConditionExpression=Key("PK").eq("DATASET#ds-1"))["Items"]
+    assert [item["SK"] for item in remaining] == ["ANOMALY#00001"]
+
+
+def test_replacing_anomalies_leaves_only_the_new_ones(table) -> None:
+    repository = DynamoDbDatasetRepository(TABLE)
+    repository.save_anomalies("ds-1", [make_anomaly(n) for n in range(1, 6)])
+
+    repository.delete_anomalies("ds-1")
+    repository.save_anomalies("ds-1", [make_anomaly(1, student_id="S00099")])
+
+    items = table.query(KeyConditionExpression=Key("PK").eq("DATASET#ds-1"))["Items"]
+    assert [(item["SK"], item["student_id"]) for item in items] == [("ANOMALY#00001", "S00099")]
+
+
+def test_delete_anomalies_for_an_unknown_dataset_is_a_no_op(table) -> None:
+    DynamoDbDatasetRepository(TABLE).delete_anomalies("nope")
+
+
+def test_too_many_anomalies_are_refused_instead_of_corrupting_the_numbering(table) -> None:
+    too_many = [make_anomaly(1)] * (MAX_ANOMALY_RECORDS + 1)
+    with pytest.raises(ValueError, match="cannot store more than"):
+        DynamoDbDatasetRepository(TABLE).save_anomalies("ds-1", too_many)
+
+
+def test_meta_stores_the_anomaly_counts_and_why_the_forest_was_skipped(table) -> None:
+    meta = make_meta(
+        anomaly_count=12, anomalies_stored=10, ml_skipped="only 10 students, at least 20 are needed"
+    )
+    DynamoDbDatasetRepository(TABLE).save_meta(meta)
+
+    item = table.get_item(Key={"PK": "DATASET#ds-1", "SK": "META"})["Item"]
+    assert (item["anomaly_count"], item["anomalies_stored"]) == (12, 10)
+    assert item["ml_skipped"] == "only 10 students, at least 20 are needed"
