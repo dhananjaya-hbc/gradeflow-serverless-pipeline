@@ -4,6 +4,7 @@ import pytest
 
 from gradeflow.infrastructure.config import (
     AnomaliesConfig,
+    ApiConfig,
     ConfigError,
     RejectConfig,
     StatsConfig,
@@ -11,6 +12,7 @@ from gradeflow.infrastructure.config import (
     TriggerConfig,
     ValidateConfig,
     load_anomalies_config,
+    load_api_config,
     load_clean_config,
     load_reject_config,
     load_stats_config,
@@ -134,3 +136,22 @@ def test_store_config_defaults_to_500_anomalies() -> None:
 def test_store_config_rejects_a_bad_anomaly_cap(value: str) -> None:
     with pytest.raises(ConfigError, match="MAX_ANOMALIES"):
         load_store_config({"TABLE_NAME": "T", "PROCESSED_BUCKET": "p", "MAX_ANOMALIES": value})
+
+
+# --- the Analytics API ---------------------------------------------------------------
+
+
+def test_api_config_values_and_default_origin() -> None:
+    env = {"TABLE_NAME": "T", "RAW_BUCKET": "raw"}
+    assert load_api_config(env) == ApiConfig("T", "raw", "*")  # open until the dashboard has a URL
+    origin = {**env, "ALLOWED_ORIGIN": "https://dashboard.example.com"}
+    assert load_api_config(origin).allowed_origin == "https://dashboard.example.com"
+    assert load_api_config({**env, "ALLOWED_ORIGIN": "  "}).allowed_origin == "*"
+
+
+@pytest.mark.parametrize("missing", ["TABLE_NAME", "RAW_BUCKET"])
+def test_api_config_needs_the_table_and_the_raw_bucket(missing: str) -> None:
+    env = {"TABLE_NAME": "T", "RAW_BUCKET": "raw"}
+    del env[missing]
+    with pytest.raises(ConfigError, match=missing):
+        load_api_config(env)
