@@ -17,4 +17,5 @@ lint = true
 capabilities = "CAPABILITY_IAM"  # SAM creates IAM roles for the Lambdas
 confirm_changeset = true         # always show the change set and ask before applying
 resolve_s3 = true                # SAM manages its own bucket for build artifacts
+resolve_image_repos = true       # SAM creates the ECR repository for the container image
 s3_prefix = "gradeflow"
