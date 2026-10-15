@@ -17,6 +17,7 @@ from tests.unit.fakes import (
     FakeWorkflow,
 )
 
+from gradeflow.application.anomaly_step import DetectAnomaliesStep
 from gradeflow.application.pipeline_steps import (
     CleanStep,
     RejectDataset,
@@ -28,6 +29,7 @@ from gradeflow.application.pipeline_steps import (
 )
 from gradeflow.domain.dataset import DatasetStatus
 from gradeflow.entrypoints import (
+    anomalies_handler,
     clean_handler,
     fail_handler,
     stats_handler,
@@ -102,7 +104,7 @@ def test_every_lambda_task_retries_and_catches(name: str) -> None:
 
 
 def test_all_catches_lead_to_the_failure_branch() -> None:
-    for name in ("Validate", "Clean", "Stats", "Store"):
+    for name in ("Validate", "Clean", "Stats", "Anomalies", "Store"):
         assert [rule["Next"] for rule in STATES[name]["Catch"]] == ["MarkFailed"]
         assert STATES[name]["Catch"][0]["ResultPath"] == "$.error"  # tells Reject: a crash
 
@@ -154,8 +156,15 @@ class Run:
             "fn:stats": self._lambda(
                 "fn:stats", lambda e: stats_handler.process(e, StatsStep(self.artifacts, 50))
             ),
+            "fn:anomalies": self._lambda(
+                "fn:anomalies",
+                lambda e: anomalies_handler.process(
+                    e, DetectAnomaliesStep(self.artifacts, 3.0, 30.0, 0.05)
+                ),
+            ),
             "fn:store": self._lambda(
-                "fn:store", lambda e: store_handler.process(e, StoreStep(self.repository))
+                "fn:store",
+                lambda e: store_handler.process(e, StoreStep(self.repository, self.artifacts)),
             ),
             "fn:fail": self._lambda(
                 "fn:fail",
@@ -185,7 +194,14 @@ def test_happy_path_runs_every_step_and_completes_the_dataset() -> None:
     run = Run(HEADER + GOOD + GOOD_2)
 
     assert run.execution.status == "SUCCEEDED"
-    assert run.execution.visited == ["Validate", "IsValid", "Clean", "Stats", "Store"]
+    assert run.execution.visited == [
+        "Validate",
+        "IsValid",
+        "Clean",
+        "Stats",
+        "Anomalies",
+        "Store",
+    ]
     assert run.meta.status == DatasetStatus.COMPLETED
     assert run.meta.clean_rows == 2
     assert run.execution.published == []  # no alert for a good file
@@ -195,10 +211,11 @@ def test_happy_path_runs_every_step_and_completes_the_dataset() -> None:
 def test_state_accumulates_each_steps_result() -> None:
     state = Run(HEADER + GOOD + GOOD_2).execution.state
 
-    assert set(state) >= {"validation", "cleaning", "stats", "result"}
+    assert set(state) >= {"validation", "cleaning", "stats", "anomalies", "result"}
     assert state["validation"]["valid"] is True
     assert state["cleaning"]["processed_key"] == "processed/ds-1/data.parquet"
     assert state["stats"]["overall"]["count"] == 2
+    assert state["anomalies"]["anomalies_key"] == "work/ds-1/anomalies.jsonl"
 
 
 def test_bad_file_skips_clean_and_stats_and_alerts() -> None:
@@ -215,6 +232,7 @@ def test_bad_file_skips_clean_and_stats_and_alerts() -> None:
     assert run.meta.status == DatasetStatus.FAILED
     assert run.quarantine.copied == [("raw", "uploads/ds-1/results.csv", "ds-1")]
     assert run.calls.get("fn:clean") is None and run.calls.get("fn:stats") is None
+    assert run.calls.get("fn:anomalies") is None
     [alert] = run.execution.published
     assert alert["TopicArn"] == "topic:alerts"
     assert alert["Subject"] == "GradeFlow: dataset failed"
@@ -286,6 +304,50 @@ def test_a_failing_alert_does_not_hide_the_failure() -> None:
     assert run.meta.status == DatasetStatus.FAILED  # recorded before the alert was attempted
 
 
+def test_a_transient_anomalies_failure_is_retried() -> None:
+    run = Run(HEADER + GOOD + GOOD_2, broken={"fn:anomalies": 3})  # fails 3 times, then works
+
+    assert run.execution.status == "SUCCEEDED"
+    assert run.execution.attempts["Anomalies"] == 4  # the first try plus all 3 retries
+    assert run.meta.status == DatasetStatus.COMPLETED
+
+
+def test_if_the_anomalies_step_keeps_failing_the_dataset_fails_without_quarantine() -> None:
+    run = Run(HEADER + GOOD + GOOD_2, broken={"fn:anomalies": None})
+
+    assert run.execution.status == "FAILED"
+    assert run.execution.visited == [
+        "Validate",
+        "IsValid",
+        "Clean",
+        "Stats",
+        "Anomalies",
+        "MarkFailed",
+        "NotifyFailure",
+        "PipelineFailed",
+    ]
+    assert run.meta.status == DatasetStatus.FAILED
+    assert "fn:anomalies is broken" in run.meta.error_message
+    assert run.quarantine.copied == []  # the file was fine; only the detection broke
+    assert "Store" not in run.execution.visited  # nothing half-written: no stats, no anomalies
+    assert run.repository.stats == {} and run.repository.anomalies == {}
+
+
+def test_a_completed_run_stores_its_anomalies_and_their_count() -> None:
+    run = Run(HEADER + GOOD + GOOD_2)
+
+    assert run.meta.anomaly_count == run.execution.state["anomalies"]["total"]
+    assert run.meta.anomalies_stored == len(run.repository.anomalies["ds-1"])
+    assert run.meta.ml_skipped == "only 2 students, at least 20 are needed"  # a tiny file
+
+
+def test_the_state_machine_cannot_skip_the_anomalies_step() -> None:
+    """Store requires the section, so a definition that bypassed Anomalies would fail loudly."""
+    assert STATES["Stats"]["Next"] == "Anomalies"
+    assert STATES["Anomalies"]["Next"] == "Store"
+    assert STATES["Anomalies"]["ResultPath"] == "$.anomalies"
+
+
 def test_the_alert_message_path_exists_on_every_route_to_it() -> None:
     """NotifyFailure reads $.failure.error_message; a missing path would be an uncatchable
     States.Runtime error, so every route into NotifyFailure must set $.failure first."""
@@ -303,7 +365,14 @@ def test_the_emulator_reports_a_missing_path_like_states_runtime() -> None:
         DEFINITION_TEXT,
         {
             name: (lambda e: {})
-            for name in ("fn:validate", "fn:clean", "fn:stats", "fn:store", "fn:fail")
+            for name in (
+                "fn:validate",
+                "fn:clean",
+                "fn:stats",
+                "fn:anomalies",
+                "fn:store",
+                "fn:fail",
+            )
         },
     )
     with pytest.raises(StatesRuntimeError):
