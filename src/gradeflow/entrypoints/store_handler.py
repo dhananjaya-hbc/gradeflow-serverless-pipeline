@@ -11,6 +11,7 @@ from gradeflow.application.pipeline_state import PipelineState
 from gradeflow.application.pipeline_steps import StoreStep
 from gradeflow.infrastructure.config import load_store_config
 from gradeflow.infrastructure.dynamodb_repository import DynamoDbDatasetRepository
+from gradeflow.infrastructure.s3_artifacts import S3DatasetArtifacts
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -23,7 +24,13 @@ def handler(event: dict[str, Any], context: object) -> dict[str, Any]:
 
 @cache
 def _build_step() -> StoreStep:
-    return StoreStep(repository=DynamoDbDatasetRepository(load_store_config().table_name))
+    config = load_store_config()
+    artifacts = S3DatasetArtifacts(config.processed_bucket) if config.processed_bucket else None
+    return StoreStep(
+        repository=DynamoDbDatasetRepository(config.table_name),
+        artifacts=artifacts,
+        max_anomalies=config.max_anomalies,
+    )
 
 
 def process(event: dict[str, Any], step: StoreStep) -> dict[str, Any]:
