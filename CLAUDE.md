@@ -179,7 +179,7 @@ JSON input: an array of objects with the same fields.
 | `DATASET#<id>` | `META` | filename, uploaded_at, status (`RECEIVED`/`PROCESSING`/`COMPLETED`/`FAILED`/`DUPLICATE`), row counts, file hash, `duplicate_of`, `quarantine_key`, error message |
 | `DATASET#<id>` | `STATS#OVERALL` | overall mean, median, pass rate, etc. |
 | `DATASET#<id>` | `STATS#SUBJECT#<subject>#<term>` | per-subject/term stats |
-| `DATASET#<id>` | `ANOMALY#<n>` | anomaly type, student_id, details, score, method (`zscore` / `isolation_forest`) |
+| `DATASET#<id>` | `ANOMALY#<rank>` (5 digits, rank 1 = most important) | `method` (`zscore` / `term_jump` / `duplicate_id` / `isolation_forest`), student_id, subject, term, score, `pattern`, severity, details (the reason) |
 | `HASH#<sha256>` | `HASH` | dataset_id (for idempotency / duplicate upload detection) |
 
 GSI for listing datasets by upload time (e.g. `GSI1PK = DATASETS`, `GSI1SK = uploaded_at`).
@@ -346,13 +346,13 @@ Claude Code: update this section at the end of every phase.
 - [x] Phase 2: Cleaning & statistics (`v0.2.0`)
 - [x] Phase 3: Reliability (`v0.3.0`)
 - [x] Phase 4: Orchestration (`v0.4.0`)
-- [ ] Phase 5: Anomaly detection (`v0.5.0`)
+- [x] Phase 5: Anomaly detection (`v0.5.0`)
 - [ ] Phase 6: Analytics API (`v0.6.0`)
 - [ ] Phase 7: Dashboard (`v0.7.0`)
 - [ ] Phase 8: Observability & security (`v0.8.0`)
 - [ ] Phase 9: CI/CD & release (`v1.0.0`)
 
-**Current phase:** Phase 5 (not started, waiting for "next phase")
+**Current phase:** Phase 6 (not started, waiting for "next phase")
 
 **Notes / decisions log:**
 - Project name **GradeFlow**, Python package `gradeflow`, repo folder `gradeflow-serverless-pipeline`.
@@ -388,3 +388,11 @@ Claude Code: update this section at the end of every phase.
 - Testing aids: `tests/unit/asl_emulator.py` runs the real ASL file against the real handlers on fakes (retries, catches, choice, ResultPath); `tests/unit/fakes.py` holds shared in-memory ports; `test_template.py` checks handler paths, env vars vs config loaders, ASL placeholders and permissions. Mutating the ASL/template made these fail, so they do catch regressions.
 - **Memory sizing (measured, `CLAUDE.md` Section 11 allows >512 MB "when needed")**: about 1.3 MB per 1,000 rows plus about 200 MB baseline. Now Trigger 512, Validate 2048, Clean 2048, Stats 1024, Store/Fail 256. Peaks for the 25 MB file: Trigger 247, Validate 842, Clean 885, Stats 364 MB. A 50 MB file (~1M rows) is *estimated* to need ~1.5 to 1.6 GB in Clean but **has not been run**: 25 MB is the largest verified size. Store used 204 of 256 MB at idle (pandas import): raise it if its payload ever grows.
 - Lessons: S3 hash claims persist, so test files must have new bytes (a broken file identical to an earlier one is correctly a `DUPLICATE`); `steps $(last_execution)` shows the newest run of *any* dataset (check it belongs to your test); zsh treats `$VAR:x` as a modifier (use `${VAR}`); a flaky connection can break large multipart uploads (use `AWS_RETRY_MODE=standard AWS_MAX_ATTEMPTS=10`, and fewer parallel streams via `aws configure set default.s3.max_concurrent_requests 2`).
+- Phase 5 (deployed + verified 2026-10-15): the seed-42 sample re-uploaded with new bytes (`--seed 42 --year 2024`, because the same bytes are a duplicate) gave `COMPLETED`, steps `Validate IsValid Clean Stats Anomalies Store`, 9 anomalies stored in exactly the locally predicted order: 1 `duplicate_id` (S00045), 5 `term_jump` (S00040 and S00055 spikes, S00034 sustained), 3 `isolation_forest` (S00034 0.739, S00055 0.667, S00040 0.655). The container gave the identical result to the laptop and to a local `docker run`.
+- Phase 5 code: `domain/anomalies.py` (3 rule detectors, `Anomaly`, `rank_anomalies`, jump patterns spike/sustained/latest), `domain/student_outliers.py` (4 per-student features, Isolation Forest, fixed seed, skip below 20 students), `application/anomaly_step.py` (`DetectAnomaliesStep`, kept in its own module so zip Lambdas never import scikit-learn: a subprocess test enforces it), `AnomalyOutcome` in the state (findings go to S3 `work/<id>/anomalies.jsonl`, never the 256 KB state), `StoreStep` writes `ANOMALY#` items (cap `MaxAnomalies`=500, META keeps the true `anomaly_count`), `entrypoints/anomalies_handler.py`, `docker/anomalies/` (Dockerfile on `public.ecr.aws/lambda/python:3.12`, arm64, exact library versions), `.dockerignore`.
+- Decisions: one Anomalies step (container Lambda) runs rules + forest; `method` has 4 values (deviation from the spec's 2); a term-jump `pattern` was added after the question "a big change can be genuine" (spike ranks above sustained; the planted S00034 is 34 -> 77 -> 99, so it is `sustained` and ranks below the spikes: kept as is, not bent); ranking is method priority, then pattern, then severity (so the cap of 500 keeps data problems and spikes first); thresholds `ZScoreLimit`=3, `JumpThreshold`=30, `IfContamination`=0.05 are SAM parameters -> env vars; a test checks template defaults equal the code defaults. Class-relative jumps (subtract the class's average change) were offered and NOT built.
+- **Measured reliability (80 generated files: 20 seeds x sizes 30/60/120/300):** rule term jumps found all 3 planted in 80/80, duplicate ID 80/80; Isolation Forest at 5%: 82% average recall and all 3 in 11/20 files for 60 students, 100% for 300 students; at 10% (60 students) 98% but ~49% precision. The forest is a second opinion; seed 42 is a lucky seed, not typical. Tests pin only what holds (>= 70% mean recall at 60 students; 100% at 300).
+- Quirks found: pandas `.assign()` of a full-length Series onto an EMPTY selection resurrects every row (fixed by masking first); identical student profiles give tied forest scores so nobody is flagged (documented in a test); a group of n scores can never exceed |z| = (n-1)/sqrt(n), so groups of 10 or fewer never trigger z>3.
+- Container facts: image 1.45 GB on disk, 322 MB compressed in ECR (free tier 500 MB for 12 months on a new account, else ~$0.03/month); `sam deploy` created the ECR repo (`resolve_image_repos = true`); `Runtime`/`CodeUri`/`Layers` moved off Globals onto the six zip functions (invalid for image functions). **Cold start**: the first start after a deploy hit Lambda's 10 s init limit (`INIT_REPORT Status: timeout`), Lambda re-ran init inside the invocation, the Anomalies state took 61 s (47 s loading libraries, 3 s real work); a warm run took 1.6 s for the whole pipeline (Anomalies 0.4 s). The 300 s timeout covers this: do not lower it. Memory used 374-379 MB on 904-row files; the 25 MB file was NOT run through Anomalies. The `joblib will operate in serial mode` warning is harmless (no shared memory on Lambda).
+- Tightening done in task 6: `StoreStep` now REQUIRES the `anomalies` section and its artifacts, the Store config requires `PROCESSED_BUCKET` (a state machine that skipped Anomalies fails loudly and writes nothing). Store's S3 permission is `s3:GetObject` on `work/*` only (pinned by a test). Mutating the ASL/template made the new tests fail.
+- **Phase 8 IAM TODO still open:** the AWS-managed `AWSLambdaSQSQueueExecutionRole` on the Trigger (all queues), and S3 policy templates with a few unused actions. New in Phase 8 scope: consider lowering image size (e.g. drop unused packages) if cold start matters.
