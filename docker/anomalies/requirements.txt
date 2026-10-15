@@ -1,0 +1,9 @@
+# Exact versions, the same as requirements-dev.txt, so the container gives the same answers
+# as the tests. boto3 is already part of the Lambda base image.
+numpy==2.5.3
+pandas==2.3.2
+pyarrow==25.0.1
+scikit-learn==1.9.1
+scipy==1.18.1
+joblib==1.6.0
+threadpoolctl==3.7.0
