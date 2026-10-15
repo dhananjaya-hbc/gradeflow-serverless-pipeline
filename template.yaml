@@ -2,9 +2,18 @@ AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
 Description: >
   GradeFlow - serverless data pipeline for education analytics.
-  Phase 5: S3 upload -> SQS (+DLQ) -> trigger Lambda (skips duplicates) -> Step Functions
+  Phase 6: S3 upload -> SQS (+DLQ) -> trigger Lambda (skips duplicates) -> Step Functions
   (validate, clean, stats, anomalies, store; failure branch quarantines, records FAILED and
   alerts) -> Parquet in S3 + DynamoDB. The anomalies step runs from a container image.
+  An API Gateway REST API (API key required) serves the results and signs upload forms.
+
+Metadata:
+  cfn-lint:
+    config:
+      # SAM generates the API key and usage plan resources with a DependsOn that the linter
+      # calls redundant (W3005). We cannot edit generated resources, and this is the only
+      # check ignored.
+      ignore_checks: [W3005]
 
 Parameters:
   MinValidRatio:
@@ -43,6 +52,13 @@ Parameters:
     MinValue: 1
     MaxValue: 10000
     Description: Most findings stored per dataset (the true total is always recorded).
+  AllowedOrigin:
+    Type: String
+    Default: "*"
+    Description: >
+      Website allowed to call the API from a browser (CORS), for example
+      https://dashboard.example.com. The default * allows any site: fine while the data is
+      synthetic and the API key is required, to be tightened once the dashboard has an address.
   PandasLayerArn:
     Type: String
     # AWS SDK for pandas 3.17.1 (pandas, numpy, pyarrow), published by AWS for
@@ -431,6 +447,77 @@ Resources:
                 - dynamodb:PutItem # META
               Resource: !GetAtt PipelineTable.Arn
 
+  # --- Analytics API ---------------------------------------------------------------
+
+  AnalyticsApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: v1 # URLs look like https://<id>.execute-api.<region>.amazonaws.com/v1/datasets
+      # The key is required on each ROUTE (see ApiFunction's events), not on the whole API:
+      # a browser's CORS preflight (OPTIONS) is sent without custom headers, so requiring the
+      # key there would make every browser call fail with 403.
+      Auth:
+        UsagePlan:
+          CreateUsagePlan: PER_API
+          Description: Caps request rate and volume, so a leaked key cannot run up a bill.
+          Throttle:
+            RateLimit: 10 # requests per second
+            BurstLimit: 20
+          Quota:
+            Limit: 5000
+            Period: DAY
+      Cors:
+        AllowOrigin: !Sub "'${AllowedOrigin}'"
+        AllowMethods: "'GET,POST,OPTIONS'"
+        AllowHeaders: "'Content-Type,X-Api-Key'"
+        MaxAge: 600
+
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Serves the Analytics API (reads DynamoDB, signs upload forms for S3).
+      Handler: gradeflow.entrypoints.api_handler.handler
+      Runtime: python3.12
+      CodeUri: src/
+      # No pandas layer on purpose: this function only reads stored items, so it starts faster.
+      Timeout: 15
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref PipelineTable
+          RAW_BUCKET: !Ref RawBucket
+          ALLOWED_ORIGIN: !Ref AllowedOrigin
+      Policies:
+        # Read-only: no Put, Delete, Update or Scan. The index is a separate resource.
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:Query
+              Resource:
+                - !GetAtt PipelineTable.Arn
+                - !Sub "${PipelineTable.Arn}/index/GSI1"
+        # Only to sign upload forms: the form can then write one object under uploads/.
+        - Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub "${RawBucket.Arn}/uploads/*"
+      Events:
+        ListDatasets:
+          Type: Api
+          Properties: { RestApiId: !Ref AnalyticsApi, Path: /datasets, Auth: { ApiKeyRequired: true }, Method: GET }
+        GetDataset:
+          Type: Api
+          Properties: { RestApiId: !Ref AnalyticsApi, Path: "/datasets/{id}", Auth: { ApiKeyRequired: true }, Method: GET }
+        GetStats:
+          Type: Api
+          Properties: { RestApiId: !Ref AnalyticsApi, Path: "/datasets/{id}/stats", Auth: { ApiKeyRequired: true }, Method: GET }
+        GetAnomalies:
+          Type: Api
+          Properties: { RestApiId: !Ref AnalyticsApi, Path: "/datasets/{id}/anomalies", Auth: { ApiKeyRequired: true }, Method: GET }
+        CreateUpload:
+          Type: Api
+          Properties: { RestApiId: !Ref AnalyticsApi, Path: /uploads, Auth: { ApiKeyRequired: true }, Method: POST }
+
   # Log groups with a retention (the default is "never expire", which slowly costs money).
   TriggerFunctionLogGroup:
     Type: AWS::Logs::LogGroup
@@ -467,6 +554,11 @@ Resources:
     Properties:
       LogGroupName: !Sub "/aws/lambda/${FailFunction}"
       RetentionInDays: 14
+  ApiFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ApiFunction}"
+      RetentionInDays: 14
 
 Outputs:
   RawBucketName:
@@ -496,6 +588,14 @@ Outputs:
   AnomaliesFunctionName:
     Description: Anomalies Lambda, a container image (check its logs in CloudWatch)
     Value: !Ref AnomaliesFunction
+  ApiUrl:
+    Description: Base URL of the Analytics API. Add a route, and send the x-api-key header.
+    Value: !Sub "https://${AnalyticsApi}.execute-api.${AWS::Region}.amazonaws.com/v1"
+  ApiKeyId:
+    Description: >
+      ID of the API key. Its value is a secret: fetch it with
+      aws apigateway get-api-key --api-key <this id> --include-value --query value --output text
+    Value: !Ref AnalyticsApiApiKey
   TriggerFunctionName:
     Description: Trigger Lambda (reads the queue; check its logs in CloudWatch)
     Value: !Ref TriggerFunction
