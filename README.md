@@ -24,12 +24,14 @@ flowchart TD
     cdn -->|"private access (OAC)"| site[("S3 dashboard bucket<br/>private")]
     browser -->|"reads, API key"| api
     browser -->|"uploads with a signed form"| raw
+    workflow -.->|"JSON logs, metrics"| cw["CloudWatch<br/>dashboard and alarms"]
+    cw -->|"alarm"| sns
 ```
 
-Everything in the diagram is built and deployed (up to v0.7.0). The dashboard is a static site: it
+Everything in the diagram is built and deployed (up to v0.8.0). The dashboard is a static site: it
 talks to the API and uploads straight to S3, with no server of its own.
 
-## What works today (v0.7.0)
+## What works today (v0.8.0)
 
 ```mermaid
 flowchart TD
@@ -146,7 +148,7 @@ reported as a `DUPLICATE` of the first one.
 Failed runs publish to an SNS topic. Pass your address at deploy time to get an email:
 `sam deploy --parameter-overrides AlertEmail=you@example.com`. AWS sends a confirmation link
 you must click once, and until then nothing is delivered. With no address the topic exists but
-has no subscribers.
+has no subscribers. The same topic receives the CloudWatch alarms (see Observability).
 
 ### Anomaly detection
 
@@ -389,6 +391,98 @@ Deliberately left as it is, and why:
 - **The API key** in the dashboard is public by design (see Dashboard), so the API's reach is capped by what its
   role can do (read-only on the table), not by the key.
 
+### Observability
+
+Logs, metrics, a dashboard and alarms, all built from the same few pieces and checked on the deployed stack.
+
+**Logs.** Every Lambda writes one JSON object per line (Powertools), with the Lambda request id, function
+name, a cold-start flag and, for every workflow step, the `dataset_id`. A crash is logged as one `ERROR` line
+with the traceback and the `dataset_id` before it is raised again, so Step Functions still retries. Logs hold
+counts and dataset ids only, never student names, IDs or rejected rows (a test runs a whole good and a failed
+dataset and checks). Set the level with the `LogLevel` parameter (`INFO` by default, `DEBUG` to investigate:
+`sam deploy --parameter-overrides LogLevel=DEBUG`).
+
+Follow one dataset through every step in CloudWatch Logs Insights (select the seven step log groups, or use
+the CLI), for example:
+
+```
+fields @timestamp, message, function_name
+| filter dataset_id = "ds-20261016-46577387"
+| sort @timestamp asc
+```
+
+On the sample file that returns, in order: `upload processed`, `validation finished`, `cleaning finished`,
+`statistics computed`, `anomaly detection finished`, `dataset stored`. Everything that went wrong in the last
+hour: `filter level = "ERROR"`. Files rejected by validation are `WARNING`.
+
+**Metrics.** Seven custom counters in the `GradeFlow` namespace, published as log lines (embedded metric format,
+so no extra permission is needed). Each handler records its counts as its last action, after its work has
+succeeded, and a handler that fails publishes nothing: a step that crashes is retried, and counting before the
+crash would count the retry twice.
+
+| Metric | Counted by | When |
+|---|---|---|
+| `RowsReceived`, `RowsRejected` | Validate | every run (a wrong-columns file counts 0) |
+| `AnomaliesFound`, `DatasetsCompleted` | Store | per completed dataset (the true total found) |
+| `DatasetsFailed` | Fail | bad files and crashes |
+| `DuplicatesSkipped` | Trigger | an upload identical to an earlier file |
+| `ApiServerErrors` | API | responses with status 500 or above |
+
+Counts are approximate under retries (SQS delivers at least once), and re-processing the same dataset id counts
+its anomalies again. A metric appears in CloudWatch 1 to 2 minutes after its first use.
+
+**Dashboard.** `gradeflow-pipeline`: alarm status, datasets, rows, anomalies, Lambda errors, throttles and p95
+duration per function, queue depth (upload and dead-letter), Step Functions runs, and API requests, errors and
+latency. Its address is the `PipelineDashboardUrl` stack output:
+
+```bash
+aws cloudformation describe-stacks --stack-name gradeflow --region ap-south-1 --query "Stacks[0].Outputs[?OutputKey=='PipelineDashboardUrl'].OutputValue" --output text
+```
+
+**Alarms** (each notifies the alert topic when it fires and when it recovers; a service that is idle counts as
+healthy, not broken):
+
+| Alarm | Fires when | What to do |
+|---|---|---|
+| `gradeflow-lambda-errors` | any of the 8 functions raises an error in 5 minutes (one alarm over all of them) | open the dashboard, then search that function's log group for `level = "ERROR"` |
+| `gradeflow-lambda-throttles` | Lambda refuses to start a function (the account limit of 10 concurrent executions) | raise the quota (see Limits) |
+| `gradeflow-dead-letter-queue` | one or more messages are in the dead-letter queue | receive the message, fix the cause, purge the queue |
+| `gradeflow-api-server-errors` | 3 or more 5XX answers in 5 minutes (counts the ones API Gateway makes when Lambda is throttled, which our code never sees) | check the Lambda alarms and the dashboard |
+
+A failed pipeline run (a bad file) is deliberately not an alarm: it is a normal outcome and already sends one
+email through the failure branch.
+
+To get emails, deploy with a real address (`sam deploy --parameter-overrides AlertEmail=you@your-address.com`)
+and click the confirmation link AWS sends. Until then the alarms still change state and publish, but nothing
+reaches an inbox (`aws sns list-subscriptions-by-topic` shows `PendingConfirmation`).
+
+**Try the alarms.** Both commands change AWS. First force a Lambda error: a run for a file that does not exist
+makes Validate raise `NoSuchKey` four times (the try plus 3 retries), and leaves one `FAILED` dataset:
+
+```bash
+SM=$(aws cloudformation describe-stacks --stack-name gradeflow --region ap-south-1 --query "Stacks[0].Outputs[?OutputKey=='PipelineStateMachineArn'].OutputValue" --output text)
+RAW=$(aws cloudformation describe-stacks --stack-name gradeflow --region ap-south-1 --query "Stacks[0].Outputs[?OutputKey=='RawBucketName'].OutputValue" --output text)
+aws stepfunctions start-execution --state-machine-arn $SM --name alarm-test-1 --region ap-south-1 --input "{\"dataset_id\":\"alarm-test-1\",\"bucket\":\"$RAW\",\"key\":\"uploads/alarm-test-1/missing.csv\",\"uploaded_at\":\"2026-01-01T10:00:00+00:00\",\"file_hash\":\"$(printf '2%.0s' {1..64})\"}"
+```
+
+On the deployed stack `gradeflow-lambda-errors` went `OK` to `ALARM` about 1 min 40 s later, and CloudWatch
+recorded `Successfully executed action` for the alert topic; it returns to `OK` by itself after about 5 to 10
+minutes without errors. Use a new `--name` each time. To clear a message from the dead-letter queue (this
+deletes it for good):
+
+```bash
+DLQ=$(aws cloudformation describe-stacks --stack-name gradeflow --region ap-south-1 --query "Stacks[0].Outputs[?OutputKey=='DeadLetterQueueUrl'].OutputValue" --output text)
+aws sqs purge-queue --queue-url $DLQ --region ap-south-1
+```
+
+The dead-letter alarm was back to `OK` within about 7 minutes of the purge (SQS metrics arrive in 5 minute steps).
+
+**Startup time (measured on AWS, first call after a deploy).** The zip steps start cold in about 1.8 s each, mostly
+the pandas layer (Powertools and its two dependencies add 6.2 MB unzipped, and the function packages are about
+1 MB); warm calls take 47 to 105 ms. The Anomalies container hit Lambda's 10 second init limit, so Lambda re-ran
+init inside the invocation and the step took 53.7 s (61 s in Phase 5, so Powertools did not make it worse);
+its 300 s timeout covers that, and a warm run is under 2 s.
+
 ## Code architecture
 
 The Python code follows **clean architecture**. Dependencies only point inward:
@@ -415,7 +509,8 @@ build if an inner layer imports boto3 or an outer layer.
 ## Tech stack
 
 Python 3.12 · AWS SAM · Lambda · S3 · SQS · Step Functions · DynamoDB · API Gateway · CloudFront ·
-pandas · scikit-learn · pytest · moto · ruff · React + Vite + Recharts · GitHub Actions
+pandas · scikit-learn · Powertools for AWS Lambda · CloudWatch · pytest · moto · ruff ·
+React + Vite + Recharts · GitHub Actions
 
 ## Local setup
 
@@ -703,7 +798,9 @@ At portfolio-demo volume this stays within the AWS Free Tier:
   S3 cost nothing at this scale. The price class is the cheapest (`PriceClass_100`), and cache clearing for the
   page is far inside the 1,000 free paths a month.
 - SQS and SNS volumes are far inside their free tiers.
-- Logs are kept for 14 days.
+- Logs are kept for 14 days. Observability stays inside the free tier: one dashboard (3 are free), 4 alarms
+  (10 are free) and 7 custom metrics (10 are free). A Logs Insights query costs about $0.005 per GB scanned
+  (following one dataset scanned 36 KB).
 
 ### Limits
 
@@ -750,5 +847,5 @@ out of scope for this project. Each Lambda also has a 15-minute ceiling (these u
 - [x] Phase 5: Anomaly detection, rule-based + Isolation Forest (`v0.5.0`)
 - [x] Phase 6: Analytics API (`v0.6.0`)
 - [x] Phase 7: Dashboard on S3 + CloudFront (`v0.7.0`)
-- [ ] Phase 8: Observability & security (`v0.8.0`)
+- [x] Phase 8: Observability & security (`v0.8.0`)
 - [ ] Phase 9: CI/CD & release (`v1.0.0`)
