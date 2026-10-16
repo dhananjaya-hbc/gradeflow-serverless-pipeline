@@ -20,14 +20,16 @@ flowchart TD
     workflow -->|"bad files"| quarantine[("S3 quarantine bucket")]
     workflow -->|"failure alert"| sns["SNS email alert"]
     ddb --> api["API Gateway and Lambda<br/>API key required"]
-    api -.-> dashboard["React dashboard<br/>Phase 7"]:::planned
-
-    classDef planned stroke-dasharray: 5 5,fill:#f4f4f4,color:#555
+    browser(["Browser<br/>React dashboard"]) -->|"HTTPS"| cdn["CloudFront"]
+    cdn -->|"private access (OAC)"| site[("S3 dashboard bucket<br/>private")]
+    browser -->|"reads, API key"| api
+    browser -->|"uploads with a signed form"| raw
 ```
 
-Solid boxes are built and deployed (up to v0.6.0). Dashed boxes are planned in later phases.
+Everything in the diagram is built and deployed (up to v0.7.0). The dashboard is a static site: it
+talks to the API and uploads straight to S3, with no server of its own.
 
-## What works today (v0.6.0)
+## What works today (v0.7.0)
 
 ```mermaid
 flowchart TD
@@ -264,8 +266,59 @@ steps. The upload then goes through the normal pipeline.
 **Security, honestly.** The API key is a gate against casual abuse and a way to rate-limit, **not real
 authentication**. A dashboard that ships the key in its JavaScript exposes it, and anyone who holds the key
 can read every dataset and start uploads. The usage plan limits damage (5 requests per second, burst 10, 5,000
-a day). The data is synthetic. Cognito is the later upgrade. CORS allows any origin (`AllowedOrigin=*`)
-until the dashboard has an address, and S3 will need its own CORS rule for browser uploads (Phase 7).
+a day). The data is synthetic. Cognito is the later upgrade. The API's CORS still allows any origin
+(`AllowedOrigin=*`; see the Dashboard section for how to tighten it), while the raw bucket's CORS rule for
+browser uploads allows only POST from the dashboard.
+
+### Dashboard
+
+A React single-page app, served privately from S3 through CloudFront. It has three pages:
+
+| Page | Address | What it does |
+|---|---|---|
+| Datasets | `#/` | Newest-first table with status badges, row and anomaly counts, "Load more". While anything is processing it refreshes by itself: every 5 s for 2 minutes, then every 15 s, and **stops after 10 minutes** (a Refresh button remains), so a stuck dataset cannot use up the API's daily quota. It also pauses while the tab is hidden. |
+| Upload | `#/upload` | Pick or drop a `.csv` or `.json` (up to 50 MB, checked before sending). The page asks the API for a signed form, posts the file straight to S3 with a progress bar, then waits until the dataset exists. S3 errors become plain sentences (empty file, too large, expired link, blocked by CORS). |
+| Dataset detail | `#/datasets/<id>` | Summary cards (rows, students, average, pass rate, anomalies), a bar chart of subject averages, a line chart of term trends, top and lowest students, class averages, the validation report, and the anomalies table with a method filter (asked of the server), a student search and "Load more". Failed datasets show the reason, duplicates link to the dataset they repeat. Every chart has a "Show as table" version with the same numbers. |
+
+How it is built:
+
+- **React 19, Vite 8, TypeScript (strict), Recharts, React Router** with hash routes (`#/...`), so
+  CloudFront needs no rewrite rules.
+- **Runtime configuration.** The build contains no address and no key. The page loads `config.json`
+  (written by the deploy script) when it starts, so one build works for any stack.
+- **A careful API client.** A new AWS account allows only 10 concurrent Lambda executions (see Limits), so
+  the client keeps at most 4 requests in flight and retries 429, 5xx and network failures up to 4 times with
+  an exponential backoff (0.3 s doubling, at most 5 s, honouring `Retry-After`). Client errors such as 404
+  are never retried.
+- **Accessible and responsive.** Light and dark themes, a skip link, labelled and keyboard-scrollable tables,
+  a visible focus outline, per-page tab titles, and a layout that reflows to phone width. The colour pairs
+  are checked in a test against the WCAG contrast minimums (4.5:1 for text, 3:1 for chart lines), in both themes.
+- **Tested against real responses.** 223 Vitest tests, using JSON captured from the deployed API as fixtures
+  (for example mean 62.43, pass rate 78.34%, 60 students and the nine anomalies of `demo-030`). The polling
+  schedule is tested with fake timers, the upload with a fake `XMLHttpRequest`.
+
+How it is hosted and secured:
+
+- The site lives in a **private** S3 bucket. Only the CloudFront distribution can read it, through an
+  **origin access control** (the bucket policy allows `s3:GetObject` for that one distribution and nothing else).
+  HTTP is redirected to HTTPS.
+- CloudFront adds security headers: HSTS, `X-Content-Type-Options`, `X-Frame-Options: DENY`,
+  `Referrer-Policy: no-referrer` and a **Content Security Policy** that allows only the site's own scripts,
+  and connections only to itself, API Gateway in the region and the raw bucket.
+- `config.json` is never cached (it holds the key); hashed asset files are cached for a year.
+- The raw bucket has a **CORS rule that allows only POST** from the deployed dashboard (and, optionally,
+  `http://localhost:5173` for development; the `DashboardDevOrigin` parameter, empty to switch it off).
+
+Honest limits of this version:
+
+- **The API key is visible to anyone who opens the site** (it is in `config.json`). It limits and meters use,
+  it is not a login. Real sign-in (Cognito) is a later option, so treat the data as public. It is synthetic.
+- The API's own CORS origin is still `*` (parameter `AllowedOrigin`). Setting it to the dashboard address
+  tightens it, at the price of breaking `npm run dev` against the deployed API.
+- The CSP names API Gateway as `*.execute-api.<region>.amazonaws.com` because naming this stack's API would
+  make the template circular (a test checks the template has no dependency cycle).
+- The JavaScript bundle is about 680 kB (200 kB compressed), mostly Recharts. Lazy-loading the charts would
+  shrink the first load; it was left out to keep the code simple.
 
 ### DynamoDB items (table `PipelineTable`)
 
@@ -312,12 +365,12 @@ build if an inner layer imports boto3 or an outer layer.
 
 ## Tech stack
 
-Python 3.12 · AWS SAM · Lambda · S3 · SQS · Step Functions · DynamoDB · API Gateway ·
+Python 3.12 · AWS SAM · Lambda · S3 · SQS · Step Functions · DynamoDB · API Gateway · CloudFront ·
 pandas · scikit-learn · pytest · moto · ruff · React + Vite + Recharts · GitHub Actions
 
 ## Local setup
 
-Requirements: Python 3.12, git. For deploying you also need the AWS CLI and SAM CLI, and
+Requirements: Python 3.12, git, and Node.js (developed on 24) for the dashboard. For deploying you also need the AWS CLI and SAM CLI, and
 **Docker Desktop running**: `sam build` builds the container image of the Anomalies step. See
 [docs/aws-setup.md](docs/aws-setup.md).
 
@@ -349,6 +402,14 @@ ruff format --check .       # formatting
 pytest                      # all tests
 pytest tests/unit           # fast, pure Python (domain, use cases, handler, config)
 pytest tests/integration    # S3 + DynamoDB adapters against moto (fake AWS, no account needed)
+```
+
+Dashboard (from the `dashboard/` folder, after `npm install`):
+
+```bash
+npm test                    # 223 tests
+npm run typecheck           # TypeScript, strict
+npm run build               # type check and production build into dashboard/dist
 ```
 
 ## Deploy to AWS
@@ -525,16 +586,54 @@ Expect `uploaded : HTTP 204` for the first (the dataset appears at the top of `G
 Lambda logs: `sam logs -n ValidateFunction --stack-name gradeflow --region ap-south-1 --tail`
 (use `TriggerFunction`, `CleanFunction`, `StatsFunction`, `AnomaliesFunction`, `StoreFunction`, `FailFunction` or `ApiFunction`).
 
+### Dashboard: deploy and run
+
+`sam deploy` creates the hosting (the private bucket, CloudFront and the upload CORS rule). The site
+itself is built and uploaded by a script, which needs the stack to exist first:
+
+```bash
+sam build
+sam deploy
+scripts/deploy_dashboard.sh
+```
+
+The script reads the stack outputs, runs the dashboard tests, builds, writes `config.json` (API address and
+key) next to the build in `dashboard/dist/` (never into the source tree), uploads the files (the page last),
+and clears the CloudFront cache for the page. `--dry-run` builds but uploads nothing; `--stack` and `--region`
+override the defaults. The address to open is the `DashboardUrl` output:
+
+```bash
+aws cloudformation describe-stacks --stack-name gradeflow --region ap-south-1 --query "Stacks[0].Outputs[?OutputKey=='DashboardUrl'].OutputValue" --output text
+```
+
+To run the dashboard on your computer against the deployed API, write the git-ignored
+`dashboard/public/config.json` once and start the dev server (open `http://localhost:5173`):
+
+```bash
+KEYID=$(aws cloudformation describe-stacks --stack-name gradeflow --region ap-south-1 --query "Stacks[0].Outputs[?OutputKey=='ApiKeyId'].OutputValue" --output text)
+KEY=$(aws apigateway get-api-key --api-key $KEYID --include-value --region ap-south-1 --query value --output text)
+URL=$(aws cloudformation describe-stacks --stack-name gradeflow --region ap-south-1 --query "Stacks[0].Outputs[?OutputKey=='ApiUrl'].OutputValue" --output text)
+printf '{\n  "apiUrl": "%s",\n  "apiKey": "%s"\n}\n' "$URL" "$KEY" > dashboard/public/config.json
+cd dashboard && npm install && npm run dev
+```
+
+Uploads from `localhost` work because the raw bucket's CORS rule allows it by default (parameter
+`DashboardDevOrigin`).
+
 ### Clean up
 
 The buckets must be empty before CloudFormation can delete them:
 
 ```bash
+SITE=$(out DashboardBucketName)
+aws s3 rm s3://$SITE --recursive
 aws s3 rm s3://$BUCKET --recursive
 aws s3 rm s3://$PROCESSED --recursive
 aws s3 rm s3://$QUARANTINE --recursive
 sam delete --stack-name gradeflow --region ap-south-1
 ```
+
+Deleting the CloudFront distribution takes several minutes.
 
 ### Cost
 
@@ -551,6 +650,9 @@ At portfolio-demo volume this stays within the AWS Free Tier:
   about $3.50 per million. The usage plan also caps it at 5,000 calls a day.
 - DynamoDB is on-demand, so it costs nothing when idle.
 - Raw and quarantined files expire after 30 days, and the temporary `work/` files after 7.
+- CloudFront (always-free tier: 1 TB and 10 million requests a month) and the few hundred kB of site files in
+  S3 cost nothing at this scale. The price class is the cheapest (`PriceClass_100`), and cache clearing for the
+  page is far inside the 1,000 free paths a month.
 - SQS and SNS volumes are far inside their free tiers.
 - Logs are kept for 14 days.
 
@@ -579,7 +681,7 @@ fine, but **60 simultaneous requests** made most of them fail with a 500: Lambda
 10 at once (CloudWatch showed 52 throttles and no function errors) and API Gateway reports that as a generic
 500. The API usage plan (5 requests per second, burst 10) helps but is **best-effort, not a guarantee**: in
 that burst it still let about 50 of 60 requests through. Two things handle it in practice: a client should
-**retry 429 and 500 with a short backoff** (the Phase 7 dashboard will), and you can request a higher quota
+**retry 429 and 500 with a short backoff** (the dashboard does: at most 4 requests at once, up to 4 attempts), and you can request a higher quota
 (free, may take days for a new account):
 `aws service-quotas request-service-quota-increase --service-code lambda --quota-code L-B99A9384 --desired-value 100`.
 The pipeline itself is protected: Step Functions retries a throttled Lambda three times, and SQS retries the trigger.
@@ -598,6 +700,6 @@ out of scope for this project. Each Lambda also has a 15-minute ceiling (these u
 - [x] Phase 4: Orchestration with Step Functions (`v0.4.0`)
 - [x] Phase 5: Anomaly detection, rule-based + Isolation Forest (`v0.5.0`)
 - [x] Phase 6: Analytics API (`v0.6.0`)
-- [ ] Phase 7: Dashboard (`v0.7.0`)
+- [x] Phase 7: Dashboard on S3 + CloudFront (`v0.7.0`)
 - [ ] Phase 8: Observability & security (`v0.8.0`)
 - [ ] Phase 9: CI/CD & release (`v1.0.0`)
