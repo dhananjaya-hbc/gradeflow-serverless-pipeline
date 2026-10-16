@@ -1,49 +1,63 @@
-/* GradeFlow dashboard. Colours are tokens so light and dark themes share one stylesheet. */
+/* GradeFlow dashboard. Colours are tokens so light and dark themes share one stylesheet.
+   Design: quiet and minimal. One slate-blue accent, hairline borders, colour only where it
+   carries meaning (status, severity). */
+
+/* Inter (variable, latin subset), served from this site: the CSP allows fonts from 'self' only. */
+@font-face {
+  font-family: "Inter Variable";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 100 900;
+  src: url("@fontsource-variable/inter/files/inter-latin-wght-normal.woff2") format("woff2-variations");
+}
 
 :root {
-  --bg: #f8fafc;
+  --bg: #f7f8fa;
   --surface: #ffffff;
   --text: #0f172a;
-  --muted: #475569;
-  --border: #cbd5e1;
-  --accent: #1d4ed8;
+  --muted: #5b6678;
+  --border: #e3e7ee;
+  --accent: #35538a;
   --accent-text: #ffffff;
-  --focus: #b45309;
-  --row-hover: #f1f5f9;
-  --success-bg: #dcfce7;
-  --success-fg: #14532d;
-  --danger-bg: #fee2e2;
-  --danger-fg: #7f1d1d;
-  --warning-bg: #fef3c7;
-  --warning-fg: #78350f;
-  --info-bg: #dbeafe;
-  --info-fg: #1e3a8a;
-  --neutral-bg: #e2e8f0;
-  --neutral-fg: #1e293b;
+  --focus: #1d4ed8;
+  --row-hover: #f3f5f9;
+  --success-bg: #e7f5ec;
+  --success-fg: #1f6b3a;
+  --danger-bg: #fdecec;
+  --danger-fg: #9b2c2c;
+  --warning-bg: #fdf3df;
+  --warning-fg: #86560a;
+  --info-bg: #e8eef8;
+  --info-fg: #2c4a7c;
+  --neutral-bg: #eceff3;
+  --neutral-fg: #3b4656;
+  --radius: 10px;
+  --shadow: 0 1px 2px rgb(15 23 42 / 0.04);
   color-scheme: light;
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #0b1220;
-    --surface: #131c2e;
-    --text: #e2e8f0;
-    --muted: #a3b1c6;
-    --border: #2b3a55;
-    --accent: #7aa7ff;
-    --accent-text: #0b1220;
-    --focus: #fbbf24;
-    --row-hover: #1a2640;
-    --success-bg: #14532d;
-    --success-fg: #dcfce7;
-    --danger-bg: #7f1d1d;
-    --danger-fg: #fee2e2;
-    --warning-bg: #78350f;
-    --warning-fg: #fef3c7;
-    --info-bg: #1e3a8a;
-    --info-fg: #dbeafe;
-    --neutral-bg: #334155;
-    --neutral-fg: #e2e8f0;
+    --bg: #0e1116;
+    --surface: #151a22;
+    --text: #e6e9ef;
+    --muted: #9aa5b5;
+    --border: #262d38;
+    --accent: #8fb0e6;
+    --accent-text: #0e1116;
+    --focus: #8fb0e6;
+    --row-hover: #1b212b;
+    --success-bg: #16311f;
+    --success-fg: #9fe0b4;
+    --danger-bg: #3a1a1a;
+    --danger-fg: #f5b5b5;
+    --warning-bg: #3a2c10;
+    --warning-fg: #f2cf8a;
+    --info-bg: #1a2a45;
+    --info-fg: #b7cdf2;
+    --neutral-bg: #232a35;
+    --neutral-fg: #c8d0dc;
+    --shadow: none;
     color-scheme: dark;
   }
 }
@@ -58,35 +72,45 @@ body {
   margin: 0;
   background: var(--bg);
   color: var(--text);
-  font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  font: 15px/1.55 "Inter Variable", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  font-feature-settings: "cv11", "ss03";
+  -webkit-font-smoothing: antialiased;
 }
 
 h1 {
-  font-size: 1.6rem;
+  font-size: 1.5rem;
+  font-weight: 650;
+  letter-spacing: -0.02em;
+  line-height: 1.25;
   margin: 0 0 0.5rem;
 }
 h2 {
-  font-size: 1.25rem;
-  margin: 2rem 0 0.75rem;
+  font-size: 1.05rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  margin: 2.25rem 0 0.75rem;
 }
 h3 {
-  font-size: 1.05rem;
+  font-size: 0.95rem;
+  font-weight: 600;
   margin: 0 0 0.5rem;
 }
 
 a {
   color: var(--accent);
+  text-underline-offset: 2px;
 }
 
 :focus-visible {
-  outline: 3px solid var(--focus);
+  outline: 2px solid var(--focus);
   outline-offset: 2px;
+  border-radius: 4px;
 }
 
 main {
-  max-width: 1100px;
+  max-width: 1080px;
   margin: 0 auto;
-  padding: 1.25rem 16px 3rem;
+  padding: 2rem 20px 4rem;
 }
 main:focus {
   outline: none; /* focus lands here from the skip link; it is not a control */
@@ -120,17 +144,21 @@ main:focus {
 
 /* Header */
 .site-header {
+  position: sticky;
+  top: 0;
+  z-index: 5;
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 0.5rem 1.5rem;
-  padding: 0.75rem 16px;
+  gap: 0.25rem 2rem;
+  padding: 0.7rem 20px;
   background: var(--surface);
   border-bottom: 1px solid var(--border);
 }
 .brand {
-  font-weight: 700;
-  font-size: 1.15rem;
+  font-weight: 650;
+  font-size: 1rem;
+  letter-spacing: -0.02em;
   text-decoration: none;
   color: var(--text);
 }
@@ -139,38 +167,68 @@ main:focus {
   gap: 0.25rem;
 }
 .site-header nav a {
-  padding: 0.35rem 0.75rem;
+  padding: 0.3rem 0.7rem;
   border-radius: 6px;
+  font-size: 0.9rem;
   text-decoration: none;
   color: var(--muted);
+  transition: color 0.12s, background-color 0.12s;
+}
+.site-header nav a:hover {
+  color: var(--text);
+  background: var(--row-hover);
 }
 .site-header nav a[aria-current="page"] {
   background: var(--info-bg);
   color: var(--info-fg);
-  font-weight: 600;
+  font-weight: 550;
 }
 
-/* Controls */
+/* Controls: quiet by default */
 button,
 select,
 input[type="search"] {
   font: inherit;
+  font-size: 0.9rem;
   color: var(--text);
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 0.4rem 0.75rem;
+  border-radius: 8px;
+  padding: 0.35rem 0.8rem;
+  box-shadow: var(--shadow);
+  transition: background-color 0.12s, border-color 0.12s;
 }
 button {
   cursor: pointer;
-  min-height: 2.5rem;
+  min-height: 2.25rem;
+  font-weight: 500;
 }
 button:hover:not(:disabled) {
   background: var(--row-hover);
+  border-color: var(--muted);
 }
 button:disabled {
-  opacity: 0.6;
+  opacity: 0.55;
   cursor: not-allowed;
+}
+input[type="file"] {
+  font: inherit;
+  font-size: 0.9rem;
+  color: var(--muted);
+}
+input[type="file"]::file-selector-button {
+  font: inherit;
+  font-weight: 500;
+  margin-right: 0.75rem;
+  padding: 0.4rem 0.9rem;
+  color: var(--accent-text);
+  background: var(--accent);
+  border: 0;
+  border-radius: 8px;
+  cursor: pointer;
+}
+input[type="file"]::file-selector-button:hover {
+  filter: brightness(1.08);
 }
 
 .page-title {
@@ -178,7 +236,7 @@ button:disabled {
   flex-wrap: wrap;
   align-items: center;
   gap: 0.5rem 1rem;
-  margin-bottom: 0.25rem;
+  margin-bottom: 0.35rem;
 }
 .page-title h1 {
   margin: 0;
@@ -190,23 +248,33 @@ button:disabled {
 
 .muted {
   color: var(--muted);
-  font-size: 0.9rem;
+  font-size: 0.875rem;
 }
 .hint {
-  padding: 0.5rem 0.75rem;
+  padding: 0.55rem 0.85rem;
   background: var(--info-bg);
   color: var(--info-fg);
-  border-radius: 6px;
+  border-radius: 8px;
+  font-size: 0.9rem;
 }
 
 /* Status badges: the words carry the meaning, the colour only helps */
 .badge {
-  display: inline-block;
-  padding: 0.1rem 0.6rem;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.1rem 0.65rem 0.1rem 0.55rem;
   border-radius: 999px;
-  font-size: 0.85rem;
-  font-weight: 600;
+  font-size: 0.8rem;
+  font-weight: 550;
   white-space: nowrap;
+}
+.badge::before {
+  content: "";
+  width: 0.4rem;
+  height: 0.4rem;
+  border-radius: 50%;
+  background: currentColor;
 }
 .badge-success {
   background: var(--success-bg);
@@ -233,17 +301,19 @@ button:disabled {
 .error-box,
 .success-box {
   margin: 1rem 0;
-  padding: 0.75rem 1rem;
-  border-radius: 8px;
-  border: 1px solid currentColor;
+  padding: 0.85rem 1rem;
+  border-radius: var(--radius);
+  border: 1px solid transparent;
 }
 .error-box {
   background: var(--danger-bg);
   color: var(--danger-fg);
+  border-color: color-mix(in srgb, var(--danger-fg) 25%, transparent);
 }
 .success-box {
   background: var(--success-bg);
   color: var(--success-fg);
+  border-color: color-mix(in srgb, var(--success-fg) 25%, transparent);
 }
 .error-box p,
 .success-box p {
@@ -254,6 +324,13 @@ button:disabled {
   color: inherit;
   background: transparent;
   border-color: currentColor;
+  box-shadow: none;
+}
+.error-box button:hover:not(:disabled),
+.success-box button:hover:not(:disabled) {
+  background: transparent;
+  border-color: currentColor;
+  text-decoration: underline;
 }
 .loading {
   color: var(--muted);
@@ -265,21 +342,26 @@ button:disabled {
   margin: 0.5rem 0 1rem;
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
 }
 table {
   width: 100%;
   border-collapse: collapse;
+  font-size: 0.9rem;
 }
 th,
 td {
-  padding: 0.55rem 0.75rem;
+  padding: 0.7rem 1rem;
   text-align: left;
   vertical-align: top;
   border-bottom: 1px solid var(--border);
 }
 thead th {
-  font-size: 0.85rem;
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
   color: var(--muted);
   white-space: nowrap;
 }
@@ -297,12 +379,13 @@ tbody tr:hover {
 
 /* Upload */
 .dropzone {
-  margin: 1rem 0;
-  padding: 2rem 1rem;
+  margin: 1.25rem 0;
+  padding: 3rem 1.5rem;
   text-align: center;
   background: var(--surface);
-  border: 2px dashed var(--border);
-  border-radius: 12px;
+  border: 1.5px dashed var(--border);
+  border-radius: 14px;
+  transition: border-color 0.12s, background-color 0.12s;
 }
 .dropzone.dragging {
   border-color: var(--accent);
@@ -310,7 +393,9 @@ tbody tr:hover {
 }
 progress {
   width: min(100%, 20rem);
+  height: 0.5rem;
   vertical-align: middle;
+  accent-color: var(--accent);
 }
 
 /* Recharts draws its own text, grid and tooltip with fixed colours: use the theme instead.
@@ -318,13 +403,22 @@ progress {
 .recharts-text,
 .recharts-cartesian-axis-tick-value {
   fill: var(--muted);
+  font-size: 12px;
 }
 .recharts-cartesian-grid line {
+  stroke: var(--border);
+  stroke-dasharray: 0;
+}
+.recharts-cartesian-axis-line,
+.recharts-cartesian-axis-tick-line {
   stroke: var(--border);
 }
 .recharts-default-tooltip {
   background-color: var(--surface) !important;
   border-color: var(--border) !important;
+  border-radius: 8px;
+  box-shadow: 0 4px 12px rgb(15 23 42 / 0.08);
+  font-size: 0.85rem;
 }
 .recharts-tooltip-label,
 .recharts-tooltip-item {
@@ -332,6 +426,7 @@ progress {
 }
 .recharts-legend-item-text {
   color: var(--text) !important;
+  font-size: 0.85rem;
 }
 
 /* Dataset detail */
@@ -339,41 +434,50 @@ progress {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(10.5rem, 1fr));
   gap: 0.75rem;
-  margin: 1rem 0;
+  margin: 1.25rem 0;
 }
 .card {
-  padding: 0.75rem 1rem;
+  padding: 1rem 1.15rem;
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
 }
 .card dt {
-  font-size: 0.85rem;
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
   color: var(--muted);
 }
 .card dd {
-  margin: 0.1rem 0 0;
-  font-size: 1.6rem;
-  font-weight: 700;
+  margin: 0.3rem 0 0;
+  font-size: 1.65rem;
+  font-weight: 650;
+  letter-spacing: -0.02em;
   font-variant-numeric: tabular-nums;
 }
 .card small {
   color: var(--muted);
+  font-size: 0.8rem;
 }
 
 figure {
   margin: 1.5rem 0;
-  padding: 1rem;
+  padding: 1.15rem 1.25rem;
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
 }
 figcaption {
   font-weight: 600;
-  margin-bottom: 0.5rem;
+  font-size: 0.95rem;
+  margin-bottom: 0.75rem;
 }
 .chart-data {
-  margin-top: 0.5rem;
+  margin-top: 0.75rem;
+  font-size: 0.875rem;
 }
 .chart-data summary {
   cursor: pointer;
@@ -383,14 +487,14 @@ figcaption {
 .student-tables {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));
-  gap: 1rem;
+  gap: 1.25rem;
   margin: 1.5rem 0;
 }
 
 .row-errors {
   padding-left: 1.25rem;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 0.9rem;
+  font-size: 0.85rem;
   overflow-wrap: anywhere;
 }
 
@@ -399,18 +503,22 @@ figcaption {
   flex-wrap: wrap;
   gap: 0.75rem 1.5rem;
   margin-bottom: 0.75rem;
+  font-size: 0.9rem;
 }
 
 @media (max-width: 40rem) {
+  main {
+    padding: 1.25rem 16px 3rem;
+  }
   h1 {
-    font-size: 1.35rem;
+    font-size: 1.3rem;
   }
   .card dd {
-    font-size: 1.35rem;
+    font-size: 1.4rem;
   }
   th,
   td {
-    padding: 0.5rem;
+    padding: 0.55rem 0.65rem;
   }
 }
 
