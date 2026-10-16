@@ -2,7 +2,7 @@
 # Build and deploy the stack. Run by the CI deploy job (see docs/ci-cd-setup.md); it can also be run by
 # hand with the same variables set.
 #
-# Settings come from the environment (the workflow fills them from GitHub repository variables):
+# Settings come from the environment (the workflow fills them from GitHub repository secrets and variables):
 #   AWS_CFN_ROLE_ARN       required   the role CloudFormation uses to build the stack
 #   AWS_REGION             optional   default ap-south-1
 #   STACK_NAME             optional   default gradeflow
