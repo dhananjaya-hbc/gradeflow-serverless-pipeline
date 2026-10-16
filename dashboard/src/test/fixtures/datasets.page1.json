@@ -1,0 +1,65 @@
+{
+  "datasets": [
+    {
+      "dataset_id": "ds-20261015-6590958f",
+      "filename": "sample_api.csv",
+      "uploaded_at": "2026-10-15T16:03:26.291000+00:00",
+      "status": "COMPLETED",
+      "total_rows": 904,
+      "valid_rows": 894,
+      "clean_rows": 891,
+      "anomaly_count": 8,
+      "duplicate_of": null,
+      "error_message": null
+    },
+    {
+      "dataset_id": "demo-031",
+      "filename": "sample_warm.csv",
+      "uploaded_at": "2026-10-15T10:13:25.073000+00:00",
+      "status": "COMPLETED",
+      "total_rows": 904,
+      "valid_rows": 894,
+      "clean_rows": 891,
+      "anomaly_count": 7,
+      "duplicate_of": null,
+      "error_message": null
+    },
+    {
+      "dataset_id": "demo-030",
+      "filename": "sample_anoms.csv",
+      "uploaded_at": "2026-10-15T10:09:30.665000+00:00",
+      "status": "COMPLETED",
+      "total_rows": 904,
+      "valid_rows": 894,
+      "clean_rows": 891,
+      "anomaly_count": 9,
+      "duplicate_of": null,
+      "error_message": null
+    },
+    {
+      "dataset_id": "demo-020",
+      "filename": "sample_25mb.csv",
+      "uploaded_at": "2026-10-14T16:28:31.848000+00:00",
+      "status": "COMPLETED",
+      "total_rows": 525004,
+      "valid_rows": 524994,
+      "clean_rows": 524991,
+      "anomaly_count": 0,
+      "duplicate_of": null,
+      "error_message": null
+    },
+    {
+      "dataset_id": "demo-014",
+      "filename": "broken2.csv",
+      "uploaded_at": "2026-10-14T15:58:13.524000+00:00",
+      "status": "FAILED",
+      "total_rows": 0,
+      "valid_rows": 0,
+      "clean_rows": 0,
+      "anomaly_count": 0,
+      "duplicate_of": null,
+      "error_message": "missing required columns: student_name, class, subject, term, year"
+    }
+  ],
+  "next_cursor": "eyJHU0kxUEsiOiAiREFUQVNFVFMiLCAiR1NJMVNLIjogIjIwMjYtMTAtMTRUMTU6NTg6MTMuNTI0MDAwKzAwOjAwIiwgIlBLIjogIkRBVEFTRVQjZGVtby0wMTQiLCAiU0siOiAiTUVUQSJ9"
+}
