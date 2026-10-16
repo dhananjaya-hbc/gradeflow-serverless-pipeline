@@ -56,6 +56,11 @@ describe.each([
     expect(contrast(theme[fg]!, theme[bg]!)).toBeGreaterThanOrEqual(4.5);
   });
 
+  it("keeps the focus ring at least 3:1 against the page and the surface", () => {
+    expect(contrast(theme["focus"]!, theme["bg"]!)).toBeGreaterThanOrEqual(3);
+    expect(contrast(theme["focus"]!, theme["surface"]!)).toBeGreaterThanOrEqual(3);
+  });
+
   it("keeps every chart colour at least 3:1 against the surface", () => {
     for (const color of CHART_COLORS) {
       expect(contrast(color, theme["surface"]!), color).toBeGreaterThanOrEqual(3);
@@ -64,6 +69,14 @@ describe.each([
 });
 
 describe("stylesheet", () => {
+  it("loads no resource from another site (the CSP allows 'self' only)", () => {
+    expect(css).not.toMatch(/url\(\s*["']?(https?:)?\/\//i);
+    expect(css).not.toMatch(/@import/i);
+  });
+  it("serves its font from the package, with a system fallback", () => {
+    expect(css).toContain("@fontsource-variable/inter/files/inter-latin-wght-normal.woff2");
+    expect(css).toMatch(/font:[^;]*"Inter Variable",\s*system-ui/);
+  });
   it("defines a dark theme that actually differs from the light one", () => {
     expect(dark["bg"]).not.toBe(light["bg"]);
     expect(dark["text"]).not.toBe(light["text"]);
