@@ -1,0 +1,100 @@
+# CI/CD setup (one time)
+
+GitHub Actions checks every push and, from `main`, deploys the stack. It logs in to AWS with **OIDC**:
+GitHub proves who it is for one run, AWS hands back temporary credentials, and no access key is stored
+anywhere. This page is the one-time setup. You do it with your normal AWS administrator login; the
+pipeline cannot do it for itself, because it creates IAM roles.
+
+## What gets created
+
+`deploy/github-oidc-role.yaml` is a small separate CloudFormation stack with two roles and no users or keys:
+
+| Role | Used by | May do |
+|---|---|---|
+| `ci-gradeflow-deploy` | the GitHub workflow | run CloudFormation on the `gradeflow` stack, upload the build, push the container image, publish the dashboard files, clear the CDN cache, read the API key, and **hand the second role to CloudFormation**. Nothing else. |
+| `ci-gradeflow-cfn-exec` | CloudFormation | create, change and delete the stack's resources (Lambda, S3, DynamoDB, SQS, SNS, API Gateway, CloudFront, IAM roles named `gradeflow-*`, and so on), each limited to the stack's names. It cannot read or write the application's data. |
+
+Why two roles: a stolen GitHub token can then only start a CloudFormation change, not create IAM roles or
+resources itself. The broad permissions sit in the second role, which only CloudFormation can assume (and
+only for this stack) and which only the deploy role can pass on.
+
+Who can log in as the deploy role: **only** a workflow of `dhananjaya-hbc/gradeflow-serverless-pipeline`
+running on the `main` branch. Pull requests, forks, other branches and tags get a different identity and
+are refused. The CI roles are named `ci-gradeflow-*` on purpose: the execution role may manage IAM roles
+called `gradeflow-*`, so it can never change the CI roles (and is explicitly denied if it tried).
+
+The account's existing GitHub OIDC provider is reused (an account can hold only one). Check it lists
+`sts.amazonaws.com` as an audience: `aws iam get-open-id-connect-provider --open-id-connect-provider-arn
+arn:aws:iam::<account-id>:oidc-provider/token.actions.githubusercontent.com`.
+
+## Steps
+
+**1. Create the roles.** From the repository root:
+
+```bash
+aws cloudformation deploy --template-file deploy/github-oidc-role.yaml --stack-name ci-gradeflow-roles --capabilities CAPABILITY_NAMED_IAM --region ap-south-1
+```
+
+It creates 2 roles and 4 managed policies. To use another repository or branch, add
+`--parameter-overrides GitHubRepository=owner/repo GitHubBranch=main`.
+
+**2. Read the role ARNs and give them to GitHub** as repository *variables* (not secrets: an ARN is not a
+credential, and the login action hides the account ID in logs):
+
+```bash
+DEPLOY_ROLE=$(aws cloudformation describe-stacks --stack-name ci-gradeflow-roles --region ap-south-1 --query "Stacks[0].Outputs[?OutputKey=='DeployRoleArn'].OutputValue" --output text)
+CFN_ROLE=$(aws cloudformation describe-stacks --stack-name ci-gradeflow-roles --region ap-south-1 --query "Stacks[0].Outputs[?OutputKey=='ExecutionRoleArn'].OutputValue" --output text)
+gh variable set AWS_DEPLOY_ROLE_ARN --body "$DEPLOY_ROLE"
+gh variable set AWS_CFN_ROLE_ARN --body "$CFN_ROLE"
+gh variable set AWS_REGION --body ap-south-1
+```
+
+**3. Set the stack parameters CI must keep.** SAM forgets `--parameter-overrides` between deploys, so the
+workflow passes these explicitly on every deploy. Without them a deploy would reset the stack to the
+template defaults:
+
+```bash
+gh variable set ALERT_EMAIL --body you@your-real-address.com
+gh variable set API_ALLOWED_ORIGIN --body "*"
+gh variable set DASHBOARD_DEV_ORIGIN --body http://localhost:5173
+```
+
+`ALERT_EMAIL` receives the alarm and failure emails (AWS sends one confirmation link the first time).
+`API_ALLOWED_ORIGIN` is the website allowed to call the API from a browser: `*` for now, or the dashboard's
+address to tighten it. `DASHBOARD_DEV_ORIGIN` lets `npm run dev` upload straight to S3; use an empty value
+(`--body ""`) to allow only the deployed dashboard.
+
+**4. (Recommended) Protect `main`** so nothing reaches it, and so nothing is deployed, without green checks.
+In GitHub: Settings, Rules, Rulesets, new branch ruleset for `main`, then require a pull request and require the
+status checks `Python (lint and tests)`, `Dashboard (types, tests, build)` and `SAM template (validate and lint)`.
+
+## Check it
+
+- `gh variable list` shows the six variables (the values are visible to you, not to the public).
+- The first push to `main` after this runs the deploy job. In the run's log, the AWS login step should say it
+  assumed `ci-gradeflow-deploy`.
+- If a step fails with `AccessDenied`, the message names the action and the role. CloudTrail (Event
+  history, filter by user name `GitHubActions` or by the role session) shows every call. Add the missing
+  action to the right policy in `deploy/github-oidc-role.yaml` (the tests in `tests/unit/test_deploy_roles.py` keep
+  the scope honest), then update the stack with the command from step 1.
+
+## Undo
+
+```bash
+aws cloudformation delete-stack --stack-name ci-gradeflow-roles --region ap-south-1
+gh variable delete AWS_DEPLOY_ROLE_ARN
+gh variable delete AWS_CFN_ROLE_ARN
+```
+
+The application stack and the deployed site are not affected; deploys then go back to `sam deploy` by hand.
+
+## Known limits
+
+- The execution role can create IAM roles named `gradeflow-*` with any inline policy, because CloudFormation
+  must be able to create the Lambda roles. That is the cost of infrastructure as code: treat the role, the
+  `main` branch and the workflow file as one trust boundary. This is why only `main` may deploy, and why
+  branch protection is recommended.
+- API Gateway and CloudFront name their resources with random ids, so their permissions are limited to the
+  kind of resource in this account and region, not to one name.
+- If the container image's repository set changes (a second image function), SAM's companion stack needs
+  ECR create rights the deploy role does not have: run that one deploy by hand.
