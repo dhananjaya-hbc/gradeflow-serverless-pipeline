@@ -1,0 +1,118 @@
+{
+  "dataset_id": "demo-030",
+  "status": "COMPLETED",
+  "anomaly_count": 9,
+  "anomalies_stored": 9,
+  "ml_skipped": null,
+  "items": [
+    {
+      "rank": 1,
+      "method": "duplicate_id",
+      "student_id": "S00045",
+      "student_name": null,
+      "subject": null,
+      "term": null,
+      "score": null,
+      "pattern": null,
+      "severity": 2,
+      "details": "student ID is used with 2 different names: 'Fake Duplicate', 'Ishara Fernando'"
+    },
+    {
+      "rank": 2,
+      "method": "term_jump",
+      "student_id": "S00040",
+      "student_name": "Chamari Wickramasinghe",
+      "subject": "Maths",
+      "term": "T2",
+      "score": 83.4,
+      "pattern": "spike",
+      "severity": 46.9,
+      "details": "Maths: score rose from 36.5 (T1) to 83.4 (T2), a change of +46.9 points; it then moved back to 44.3 in T3, so this looks like a spike"
+    },
+    {
+      "rank": 3,
+      "method": "term_jump",
+      "student_id": "S00055",
+      "student_name": "Ishara Bandara",
+      "subject": "Science",
+      "term": "T2",
+      "score": 76.5,
+      "pattern": "spike",
+      "severity": 44.8,
+      "details": "Science: score rose from 31.7 (T1) to 76.5 (T2), a change of +44.8 points; it then moved back to 41.7 in T3, so this looks like a spike"
+    },
+    {
+      "rank": 4,
+      "method": "term_jump",
+      "student_id": "S00040",
+      "student_name": "Chamari Wickramasinghe",
+      "subject": "Maths",
+      "term": "T3",
+      "score": 44.3,
+      "pattern": "spike",
+      "severity": 39.1,
+      "details": "Maths: score fell from 83.4 (T2) to 44.3 (T3), a change of -39.1 points; this reverses the earlier jump, so it looks like a spike"
+    },
+    {
+      "rank": 5,
+      "method": "term_jump",
+      "student_id": "S00055",
+      "student_name": "Ishara Bandara",
+      "subject": "Science",
+      "term": "T3",
+      "score": 41.7,
+      "pattern": "spike",
+      "severity": 34.8,
+      "details": "Science: score fell from 76.5 (T2) to 41.7 (T3), a change of -34.8 points; this reverses the earlier jump, so it looks like a spike"
+    },
+    {
+      "rank": 6,
+      "method": "term_jump",
+      "student_id": "S00034",
+      "student_name": "Malsha Silva",
+      "subject": "Science",
+      "term": "T2",
+      "score": 77,
+      "pattern": "sustained",
+      "severity": 42.6,
+      "details": "Science: score rose from 34.4 (T1) to 77 (T2), a change of +42.6 points; it did not go back in T3 (99.3)"
+    },
+    {
+      "rank": 7,
+      "method": "isolation_forest",
+      "student_id": "S00034",
+      "student_name": "Malsha Silva",
+      "subject": null,
+      "term": null,
+      "score": null,
+      "pattern": null,
+      "severity": 0.739,
+      "details": "unusual student profile: spread between subjects 12.9 points is 4.5 standard deviations above the typical student (4.6)"
+    },
+    {
+      "rank": 8,
+      "method": "isolation_forest",
+      "student_id": "S00055",
+      "student_name": "Ishara Bandara",
+      "subject": null,
+      "term": null,
+      "score": null,
+      "pattern": null,
+      "severity": 0.667,
+      "details": "unusual student profile: average change between terms 15.6 points is 3.6 standard deviations above the typical student (7.3)"
+    },
+    {
+      "rank": 9,
+      "method": "isolation_forest",
+      "student_id": "S00040",
+      "student_name": "Chamari Wickramasinghe",
+      "subject": null,
+      "term": null,
+      "score": null,
+      "pattern": null,
+      "severity": 0.655,
+      "details": "unusual student profile: largest change between consecutive terms 46.9 points is 3.9 standard deviations above the typical student (17.3)"
+    }
+  ],
+  "next_cursor": null
+}
