@@ -547,5 +547,11 @@
    "ecr",
    "UploadLayerPart"
   ]
- ]
+ ],
+ "denied_to_the_execution_role_in_the_first_successful_ci_deploy": {
+  "about": "AccessDenied errors CloudTrail recorded for the execution role during the first successful CI deploy (run 38912878861, attempt 2), as the IAM action named in the error message. Benign answers such as NoSuchCORSConfiguration are not listed.",
+  "iam_actions": [
+   "s3:ListTagsForResource"
+  ]
+ }
 }
