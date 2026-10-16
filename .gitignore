@@ -28,6 +28,8 @@ data/
 # Frontend
 node_modules/
 dashboard/dist/
+# Holds the API key: written by scripts/deploy_dashboard.sh, never commit it
+dashboard/public/config.json
 
 # OS / editor
 .DS_Store
