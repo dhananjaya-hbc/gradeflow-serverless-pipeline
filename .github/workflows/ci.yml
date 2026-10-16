@@ -2,7 +2,11 @@
 # deploys to AWS from the main branch once all of them pass.
 #
 # Only the deploy job has any AWS access. It logs in with OIDC (a short-lived role, no stored keys):
-# see docs/ci-cd-setup.md for the one-time setup and the repository variables it reads.
+# see docs/ci-cd-setup.md for the one-time setup.
+#
+# It reads three repository secrets (the two role ARNs, which contain the AWS account id, and the
+# alert email address). None is a credential. They are secrets only because GitHub prints a
+# variable's value in the run log, and this repository's logs are public; a secret is masked.
 #
 # Actions are pinned to a full commit SHA, with the version in a comment, so a moved tag cannot
 # change what runs here. Dependabot proposes updates.
@@ -99,18 +103,18 @@ jobs:
       cancel-in-progress: false
     env:
       AWS_REGION: ${{ vars.AWS_REGION }}
-      AWS_CFN_ROLE_ARN: ${{ vars.AWS_CFN_ROLE_ARN }}
-      ALERT_EMAIL: ${{ vars.ALERT_EMAIL }}
+      AWS_CFN_ROLE_ARN: ${{ secrets.AWS_CFN_ROLE_ARN }}
+      ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
       API_ALLOWED_ORIGIN: ${{ vars.API_ALLOWED_ORIGIN }}
       DASHBOARD_DEV_ORIGIN: ${{ vars.DASHBOARD_DEV_ORIGIN }}
       STACK_NAME: gradeflow
     steps:
       - name: Check the deploy variables are set
         env:
-          DEPLOY_ROLE: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          DEPLOY_ROLE: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
         run: |
-          : "${DEPLOY_ROLE:?Set the repository variable AWS_DEPLOY_ROLE_ARN (see docs/ci-cd-setup.md)}"
-          : "${AWS_CFN_ROLE_ARN:?Set the repository variable AWS_CFN_ROLE_ARN (see docs/ci-cd-setup.md)}"
+          : "${DEPLOY_ROLE:?Set the repository secret AWS_DEPLOY_ROLE_ARN (see docs/ci-cd-setup.md)}"
+          : "${AWS_CFN_ROLE_ARN:?Set the repository secret AWS_CFN_ROLE_ARN (see docs/ci-cd-setup.md)}"
           : "${AWS_REGION:?Set the repository variable AWS_REGION (see docs/ci-cd-setup.md)}"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -128,7 +132,7 @@ jobs:
           version: 1.166.2 # the same version the template job lints with
       - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
           role-session-name: github-deploy-${{ github.run_id }}
           mask-aws-account-id: true
