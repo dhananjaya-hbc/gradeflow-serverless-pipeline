@@ -7,3 +7,7 @@ scikit-learn==1.9.1
 scipy==1.18.1
 joblib==1.6.0
 threadpoolctl==3.7.0
+# Logging and metrics, the same versions as the zip Lambdas (src/requirements.txt)
+aws-lambda-powertools==3.36.0
+typing-extensions==4.16.0
+jmespath==1.1.0
