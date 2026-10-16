@@ -13,7 +13,10 @@ dimension value counts as a new metric. So the names are a closed list (`MetricN
 share the single `service` dimension, and a test keeps the list at 10 or fewer.
 """
 
+import functools
+from collections.abc import Callable
 from enum import StrEnum
+from typing import Any
 
 from aws_lambda_powertools import Logger, Metrics
 from aws_lambda_powertools.metrics import MetricUnit
@@ -38,10 +41,32 @@ class MetricName(StrEnum):
 logger = Logger(service=SERVICE_NAME)
 metrics = Metrics(namespace=METRICS_NAMESPACE, service=SERVICE_NAME)
 
-# Decorator for every handler. It adds the Lambda request id, function name and a cold-start flag
-# to each log line, and `clear_state=True` forgets keys added during the call (such as dataset_id)
-# when it ends: without it a warm container would stamp the next dataset's logs with the old id.
-with_logging = logger.inject_lambda_context(clear_state=True)
+_inject_context = logger.inject_lambda_context(clear_state=True)
+
+
+def with_logging(handler: Callable[[Any, Any], Any]) -> Callable[[Any, Any], Any]:
+    """Decorator for every Lambda handler.
+
+    - Each log line gets the Lambda request id, function name and a cold-start flag.
+    - `clear_state=True` forgets the keys of the previous call when a new call starts: without it
+      a warm container would stamp the next dataset's log lines with the old dataset_id.
+    - A workflow step receives the pipeline state, so its `dataset_id` is added to every line.
+    - An exception that escapes the handler is logged as one JSON line (with the traceback and the
+      dataset_id) and raised again, so Step Functions and SQS still see the failure and retry.
+      Lambda's own traceback output is plain text that Logs Insights cannot filter by field.
+    """
+
+    @functools.wraps(handler)
+    def wrapper(event: Any, context: Any) -> Any:
+        if isinstance(event, dict) and isinstance(event.get("dataset_id"), str):
+            logger.append_keys(dataset_id=event["dataset_id"])
+        try:
+            return handler(event, context)
+        except Exception:
+            logger.exception("handler failed")
+            raise
+
+    return _inject_context(wrapper)
 
 
 def record_metric(name: MetricName, value: float = 1) -> None:
