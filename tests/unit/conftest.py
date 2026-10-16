@@ -6,7 +6,7 @@ from collections.abc import Iterator
 
 import pytest
 
-from gradeflow.infrastructure.observability import logger
+from gradeflow.infrastructure.observability import logger, metrics
 
 
 class LogCapture:
@@ -52,3 +52,25 @@ class FakeLambdaContext:
 @pytest.fixture
 def lambda_context() -> FakeLambdaContext:
     return FakeLambdaContext()
+
+
+@pytest.fixture(autouse=True)
+def _empty_metric_queue() -> Iterator[None]:
+    """Handlers queue metrics in a shared object. Start and end every test with it empty, so a
+    test that calls a handler's `process` directly cannot leak counts into the next one."""
+    metrics.clear_metrics()
+    yield
+    metrics.clear_metrics()
+
+
+class RecordedMetrics:
+    """The metrics queued so far and not yet published."""
+
+    @property
+    def totals(self) -> dict[str, float]:
+        return {name: sum(data["Value"]) for name, data in metrics.metric_set.items()}
+
+
+@pytest.fixture
+def recorded() -> RecordedMetrics:
+    return RecordedMetrics()
