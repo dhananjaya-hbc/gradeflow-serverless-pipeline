@@ -4,7 +4,6 @@ saying the file is bad, or `error` set by the state machine's Catch).
 Handler path in template.yaml: gradeflow.entrypoints.fail_handler.handler
 """
 
-import logging
 from functools import cache
 from typing import Any
 
@@ -12,12 +11,11 @@ from gradeflow.application.pipeline_state import PipelineState
 from gradeflow.application.pipeline_steps import RejectDataset
 from gradeflow.infrastructure.config import load_reject_config
 from gradeflow.infrastructure.dynamodb_repository import DynamoDbDatasetRepository
+from gradeflow.infrastructure.observability import logger, with_logging
 from gradeflow.infrastructure.s3_quarantine import S3Quarantine
 
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
 
-
+@with_logging
 def handler(event: dict[str, Any], context: object) -> dict[str, Any]:
     """Lambda entry point."""
     return process(event, _build_step())
@@ -34,7 +32,12 @@ def _build_step() -> RejectDataset:
 
 def process(event: dict[str, Any], step: RejectDataset) -> dict[str, Any]:
     meta = step.execute(PipelineState.from_dict(event))
-    logger.warning("dataset %s FAILED: %s", meta.dataset_id, meta.error_message)
+    logger.warning(
+        "dataset failed",
+        dataset_id=meta.dataset_id,
+        error_message=meta.error_message,
+        quarantined=meta.quarantine_key is not None,
+    )
     return {
         "dataset_id": meta.dataset_id,
         "status": meta.status.value,
