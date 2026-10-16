@@ -1,9 +1,53 @@
 # GradeFlow: Serverless Data Pipeline for Education Analytics
 
+[![CI](https://github.com/dhananjaya-hbc/gradeflow-serverless-pipeline/actions/workflows/ci.yml/badge.svg)](https://github.com/dhananjaya-hbc/gradeflow-serverless-pipeline/actions/workflows/ci.yml)
+
 An event-driven AWS pipeline that validates, cleans, analyses and flags anomalies in
 student results datasets, then serves the results through an API to a web dashboard.
+Upload a CSV or JSON file and a few seconds later the dashboard shows subject averages, pass
+rates, top and bottom students, and flagged anomalies (suspicious score jumps, duplicate IDs,
+statistical outliers). The whole stack is one SAM template, and every push to `main` that passes
+the tests deploys itself with no stored AWS keys.
 
-> 🚧 Work in progress, being built phase by phase. See [Roadmap](#roadmap).
+Built as a learning and portfolio project, phase by phase (see [Roadmap](#roadmap)). All data is
+synthetic.
+
+**Contents:** [Features](#features) · [Screenshots and demo](#screenshots-and-demo) ·
+[Architecture](#architecture) · [CI/CD](#cicd) · [Design decisions](#design-decisions) ·
+[Deploy](#deploy-to-aws) · [Cost](#cost) · [Limits](#limits) · [Future improvements](#future-improvements)
+
+## Features
+
+- **Event-driven processing:** S3 upload, then SQS (with a dead-letter queue), then a Step Functions
+  workflow of six Lambdas with per-step retries and a failure branch.
+- **Reliable by design:** duplicate uploads are detected by SHA-256 and skipped; bad files are
+  quarantined and marked `FAILED`; an email alert is sent on failure.
+- **Anomaly detection:** three rule-based detectors (z-score, term-to-term jump, duplicate student ID)
+  plus an Isolation Forest running in a container-image Lambda. Reliability was measured, not assumed
+  (see [Anomaly detection](#anomaly-detection)).
+- **Analytics API:** five REST endpoints behind an API key, with paging, filters and CORS.
+- **Dashboard:** React + Recharts, hosted privately on S3 behind CloudFront; upload with progress,
+  live status, charts with table alternatives.
+- **Observability:** structured JSON logs, 7 custom metrics, a CloudWatch dashboard and 4 alarms.
+- **Least-privilege security:** exact IAM statements per function (pinned by tests), TLS-only buckets,
+  no public buckets, CSP and security headers on the dashboard.
+- **CI/CD:** lint, tests and template checks on every push; deploy from `main` through GitHub OIDC.
+- **Well tested:** 1,045 pytest tests (domain, use cases, handlers, adapters on moto, the real
+  state machine file run by an emulator, the template, the workflows) and 223 Vitest tests.
+
+## Screenshots and demo
+
+> TODO before sharing: add the images to `docs/screenshots/` and replace this block.
+
+| Datasets list | Dataset detail |
+|---|---|
+| _screenshot: `docs/screenshots/datasets.png`_ | _screenshot: `docs/screenshots/detail.png`_ |
+
+| CloudWatch dashboard | Step Functions run |
+|---|---|
+| _screenshot: `docs/screenshots/cloudwatch.png`_ | _screenshot: `docs/screenshots/stepfunctions.png`_ |
+
+Demo video: _link to be added_
 
 ## Architecture
 
@@ -28,10 +72,10 @@ flowchart TD
     cw -->|"alarm"| sns
 ```
 
-Everything in the diagram is built and deployed (up to v0.8.0). The dashboard is a static site: it
+Everything in the diagram is built and deployed. The dashboard is a static site: it
 talks to the API and uploads straight to S3, with no server of its own.
 
-## What works today (v0.8.0)
+## How it works
 
 ```mermaid
 flowchart TD
@@ -483,6 +527,35 @@ the pandas layer (Powertools and its two dependencies add 6.2 MB unzipped, and t
 init inside the invocation and the step took 53.7 s (61 s in Phase 5, so Powertools did not make it worse);
 its 300 s timeout covers that, and a warm run is under 2 s.
 
+## CI/CD
+
+One workflow, [`.github/workflows/ci.yml`](.github/workflows/ci.yml), with four jobs:
+
+| Job | Runs on | What it does |
+|---|---|---|
+| `python` | every push and PR | `ruff check`, `ruff format --check`, `pytest` |
+| `dashboard` | every push and PR | `npm ci`, typecheck, Vitest, production build |
+| `template` | every push and PR | `sam validate --lint` |
+| `deploy` | push to `main` only, after the three above | `sam build` and `sam deploy`, dashboard upload, smoke test |
+
+How the deploy gets into AWS **without any stored keys**:
+
+- GitHub proves who it is with a short-lived OIDC token; AWS trusts only this exact repository and the
+  `main` branch. The trust uses GitHub's **immutable subject claim** (numeric owner and repository IDs),
+  so a deleted-and-recreated repo with the same name cannot assume the role.
+- **Two roles.** The deploy role can only start CloudFormation and upload artifacts. CloudFormation then
+  builds the stack with a separate **execution role** (`sam deploy --role-arn`) that holds the permissions
+  to create each resource type. Neither role can modify the CI roles themselves (explicit deny).
+- The role ARNs and the alert email are repository **secrets**, not variables, because this repository
+  is public and GitHub prints variables in logs.
+- Every third-party action is pinned to a commit SHA, Dependabot keeps them current, and `actionlint`
+  plus a JSON-schema check run inside the test suite.
+- After deploying, `scripts/smoke_test.py` checks the live dashboard and API (page, security headers,
+  cache headers, `config.json`, 200 with the key, 403 without it, CORS preflight).
+
+The execution role's permissions were derived from evidence: CloudTrail records of a real deploy and the
+IAM policy simulator, kept as a test fixture. One-time setup is in [docs/ci-cd-setup.md](docs/ci-cd-setup.md).
+
 ## Code architecture
 
 The Python code follows **clean architecture**. Dependencies only point inward:
@@ -506,11 +579,28 @@ flowchart TD
 Business logic is testable without AWS, and `tests/unit/test_architecture.py` fails the
 build if an inner layer imports boto3 or an outer layer.
 
+## Design decisions
+
+| Decision | Why | Trade-off |
+|---|---|---|
+| SQS between S3 and the workflow | Buffers bursts, retries, and a poison message lands in a DLQ instead of being lost | About 36 minutes to reach the DLQ with the safe visibility timeout |
+| Step Functions instead of one big Lambda | Per-step retries, a visible run history, a clean failure branch | More moving parts; stats travel in the state (limit 256 KB, 3 KB used) |
+| A bad file is a returned `valid=false`, not an exception | No pointless retries of something that can never succeed | Needs an explicit Choice state |
+| Idempotency by file SHA-256 | Same bytes under a new name are `DUPLICATE`, not reprocessed | A failed file keeps its claim, so a fixed file must have new bytes |
+| Single DynamoDB table with a GSI | One table, on-demand, newest-first listing | Access patterns must be designed up front |
+| Container image only for Anomalies | scikit-learn does not fit a zip Lambda | 54 s first cold start, 1.45 GB image |
+| Isolation Forest as a second opinion | Rules find planted jumps 80/80; the forest adds statistical outliers | Recall depends on dataset size (see below) |
+| Powertools via pip, not the managed layer | The pandas layer already uses most of the 250 MB cap | Slightly larger zips |
+| Metrics as embedded metric format | No `PutMetricData` permission needed | Metrics appear a minute after the log line |
+| REST API with an API key | HTTP APIs have no built-in keys | The key in the browser is public by design: it limits abuse, it is not authentication |
+| Clean architecture with a test enforcing it | Business logic runs without AWS | A few more files and ports |
+| Hash routes in the dashboard | CloudFront needs no rewrite rules | URLs contain `#` |
+
 ## Tech stack
 
 Python 3.12 · AWS SAM · Lambda · S3 · SQS · Step Functions · DynamoDB · API Gateway · CloudFront ·
 pandas · scikit-learn · Powertools for AWS Lambda · CloudWatch · pytest · moto · ruff ·
-React + Vite + Recharts · GitHub Actions
+React + Vite + Recharts · GitHub Actions (OIDC)
 
 ## Local setup
 
@@ -781,7 +871,29 @@ Deleting the CloudFront distribution takes several minutes.
 
 ### Cost
 
-At portfolio-demo volume this stays within the AWS Free Tier:
+**Measured:** AWS Cost Explorer showed **$0.00** for October 1 to 16, 2026, with every service inside
+its free tier.
+
+**List prices** (Mumbai, `ap-south-1`, from the AWS Pricing API) for what happens once the free tiers
+end:
+
+| Item | Price |
+|---|---|
+| Lambda requests (arm64) | $0.20 per million |
+| Lambda duration (arm64) | $0.0000133334 per GB-second |
+| API Gateway REST | $3.50 per million calls |
+| DynamoDB on-demand | $0.70 per million writes, $0.10 per million reads |
+| Step Functions Standard | $0.0000285 per state transition |
+| SQS | $0.30 per million requests |
+| S3 standard | $0.023 per GB-month |
+| CloudWatch | $0.10 per alarm per month, $0.30 per custom metric per month, $0.67 per GB of logs ingested |
+
+A worked example: 100 uploads of the 904-row sample a month is about 1,000 state transitions (about
+$0.03) and well under a cent of Lambda time. A 25 MB file used about 30 GB-seconds, roughly $0.0004 at list
+price. The fixed items are the alarms (4) and metrics (7) if you go beyond the CloudWatch free tier
+(10 alarms, 10 custom metrics, 3 dashboards), and ECR storage for the 322 MB image.
+A new account's 12-month free tiers make the first year cheaper still. Details per service:
+
 
 - Lambda runs on arm64. Memory is sized per step (see Limits): 512 MB Trigger, 2048 MB
   Validate, Clean and Anomalies, 1024 MB Stats, 256 MB Store and Fail.
@@ -837,6 +949,38 @@ Extrapolating the same figures, a 50 MB file (about a million rows) should need 
 verified. Files much beyond 50 MB would need chunked processing, AWS Glue or Fargate, which are
 out of scope for this project. Each Lambda also has a 15-minute ceiling (these use 30 to 120 s).
 
+### Honest limits
+
+Things that are true of this project and that a reader should know:
+
+- **The CI-built container image has not been run end to end.** The first image was built and verified on
+  a laptop; CI builds it on an arm64 runner and the deploy succeeded, but no upload was run through that
+  specific image.
+- **The SAM transform permission** on the execution role is checked by CloudFormation, not IAM, so it
+  cannot be simulated; it is proven only by a real deploy.
+- **The Anomalies cold start** is about 54 seconds after a deploy (Lambda's 10 s init limit is hit and
+  init is re-run). The 300 s timeout covers it; a smaller image would help.
+- **The image build is not reproducible bit for bit** (base image and OS packages move).
+- **Email delivery of alarms is not proven.** The alarm fired and CloudWatch recorded the action, but
+  the only subscriber was an unconfirmed placeholder address when it was tested.
+- **The API key in `config.json` is public.** It protects against casual abuse only. The API's CORS origin
+  is still `*` by default.
+- **Isolation Forest recall depends on dataset size:** 82% on average for 60 students (all 3 planted
+  anomalies in 11 of 20 files) and 100% for 300 students. The rule detectors found all planted jumps in
+  80 of 80 files.
+- **Largest file run:** 25 MB. A 50 MB file is estimated, not measured.
+
+## Future improvements
+
+- Real authentication (Cognito) instead of a shared API key.
+- Tighten the API's CORS origin to the dashboard address.
+- Lazy-load the charts (the bundle is 678 kB, 202 kB gzipped, mostly Recharts).
+- A smaller anomalies image (drop unused packages) to shorten the cold start, or provisioned concurrency.
+- Class-relative score jumps (subtract the class's average change) to cut false positives.
+- Chunked processing with AWS Glue or Fargate for files beyond 50 MB.
+- X-Ray tracing, API Gateway and CloudFront access logs, and a WAF.
+- A multi-environment pipeline (staging before production) with manual approval.
+
 ## Roadmap
 
 - [x] Phase 0: Project setup
@@ -848,4 +992,4 @@ out of scope for this project. Each Lambda also has a 15-minute ceiling (these u
 - [x] Phase 6: Analytics API (`v0.6.0`)
 - [x] Phase 7: Dashboard on S3 + CloudFront (`v0.7.0`)
 - [x] Phase 8: Observability & security (`v0.8.0`)
-- [ ] Phase 9: CI/CD & release (`v1.0.0`)
+- [x] Phase 9: CI/CD & release (`v1.0.0`)
