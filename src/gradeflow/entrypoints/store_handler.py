@@ -10,11 +10,18 @@ from gradeflow.application.pipeline_state import PipelineState
 from gradeflow.application.pipeline_steps import StoreStep
 from gradeflow.infrastructure.config import load_store_config
 from gradeflow.infrastructure.dynamodb_repository import DynamoDbDatasetRepository
-from gradeflow.infrastructure.observability import logger, with_logging
+from gradeflow.infrastructure.observability import (
+    MetricName,
+    logger,
+    record_metric,
+    with_logging,
+    with_metrics,
+)
 from gradeflow.infrastructure.s3_artifacts import S3DatasetArtifacts
 
 
 @with_logging
+@with_metrics
 def handler(event: dict[str, Any], context: object) -> dict[str, Any]:
     """Lambda entry point."""
     return process(event, _build_step())
@@ -38,4 +45,9 @@ def process(event: dict[str, Any], step: StoreStep) -> dict[str, Any]:
         status=meta.status.value,
         anomaly_count=meta.anomaly_count,
     )
-    return {"dataset_id": meta.dataset_id, "status": meta.status.value}
+    result = {"dataset_id": meta.dataset_id, "status": meta.status.value}
+    # Last, after everything succeeded (see record_metric). The count is the true total found,
+    # not only the findings that were stored.
+    record_metric(MetricName.DATASETS_COMPLETED)
+    record_metric(MetricName.ANOMALIES_FOUND, meta.anomaly_count)
+    return result
