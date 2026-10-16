@@ -70,5 +70,34 @@ def with_logging(handler: Callable[[Any, Any], Any]) -> Callable[[Any, Any], Any
 
 
 def record_metric(name: MetricName, value: float = 1) -> None:
-    """Queue a count. It is published when the handler returns (`@metrics.log_metrics`)."""
+    """Queue a count. It is published when the handler returns (see `with_metrics`).
+
+    Call it as the LAST thing a handler does, after all the work has succeeded: a step that
+    crashes is retried, and a count recorded before the crash would be counted a second time.
+    """
     metrics.add_metric(name=name.value, unit=MetricUnit.Count, value=value)
+
+
+def with_metrics(handler: Callable[[Any, Any], Any]) -> Callable[[Any, Any], Any]:
+    """Decorator for a handler that records metrics (use it below `with_logging`).
+
+    - Publishes what the handler queued, once, when it returns. When nothing was queued it
+      publishes nothing (Powertools' own decorator warns on every such call).
+    - If the handler raises, the queued counts are thrown away: the call will be retried, and
+      counting it now would count it twice.
+    - Starts every call from an empty queue, so a failed flush cannot leak into the next call.
+    """
+
+    @functools.wraps(handler)
+    def wrapper(event: Any, context: Any) -> Any:
+        metrics.clear_metrics()
+        try:
+            result = handler(event, context)
+        except Exception:
+            metrics.clear_metrics()
+            raise
+        if metrics.metric_set:
+            metrics.flush_metrics()
+        return result
+
+    return wrapper
