@@ -2,10 +2,11 @@ AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
 Description: >
   GradeFlow - serverless data pipeline for education analytics.
-  Phase 6: S3 upload -> SQS (+DLQ) -> trigger Lambda (skips duplicates) -> Step Functions
+  Phase 7: S3 upload -> SQS (+DLQ) -> trigger Lambda (skips duplicates) -> Step Functions
   (validate, clean, stats, anomalies, store; failure branch quarantines, records FAILED and
   alerts) -> Parquet in S3 + DynamoDB. The anomalies step runs from a container image.
   An API Gateway REST API (API key required) serves the results and signs upload forms.
+  A React dashboard is served privately from S3 through CloudFront (origin access control).
 
 Metadata:
   cfn-lint:
@@ -59,6 +60,15 @@ Parameters:
       Website allowed to call the API from a browser (CORS), for example
       https://dashboard.example.com. The default * allows any site: fine while the data is
       synthetic and the API key is required, to be tightened once the dashboard has an address.
+  DashboardDevOrigin:
+    Type: String
+    Default: "http://localhost:5173"
+    AllowedPattern: '^$|^https?://[^/\s*]+$'
+    ConstraintDescription: Leave empty, or give an origin such as http://localhost:5173 (no path, no wildcard).
+    Description: >
+      Extra website allowed to upload files straight to S3 from a browser, for running the
+      dashboard on your own computer (npm run dev). The deployed dashboard is always allowed.
+      Set it to an empty value to allow only the deployed dashboard.
   PandasLayerArn:
     Type: String
     # AWS SDK for pandas 3.17.1 (pandas, numpy, pyarrow), published by AWS for
@@ -77,6 +87,7 @@ Parameters:
 
 Conditions:
   HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
+  HasDashboardDevOrigin: !Not [!Equals [!Ref DashboardDevOrigin, ""]]
 
 Globals:
   # Only settings valid for BOTH zip and container-image functions. Runtime, CodeUri and Layers
@@ -122,6 +133,19 @@ Resources:
                 Rules:
                   - Name: prefix
                     Value: uploads/
+      # The dashboard uploads with a browser POST to this bucket (a pre-signed form). Browsers
+      # refuse that unless the bucket says the dashboard's origin may do it. Only POST, only
+      # the deployed dashboard (and, optionally, a local dev server): never a wildcard.
+      CorsConfiguration:
+        CorsRules:
+          - AllowedMethods: [POST]
+            AllowedOrigins: !If
+              - HasDashboardDevOrigin
+              - - !Sub "https://${DashboardDistribution.DomainName}"
+                - !Ref DashboardDevOrigin
+              - - !Sub "https://${DashboardDistribution.DomainName}"
+            AllowedHeaders: ["*"]
+            MaxAge: 3600
 
   ProcessedBucket:
     Type: AWS::S3::Bucket
@@ -522,6 +546,125 @@ Resources:
           Type: Api
           Properties: { RestApiId: !Ref AnalyticsApi, Path: /uploads, Auth: { ApiKeyRequired: true }, Method: POST }
 
+  # --- Dashboard hosting -----------------------------------------------------------
+  # The React build is copied into a PRIVATE bucket (scripts/deploy_dashboard.sh). Only this
+  # CloudFront distribution may read it, through an origin access control (OAC): nobody can
+  # open the bucket directly, and every visitor gets HTTPS.
+
+  DashboardBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-site-${AWS::AccountId}-${AWS::Region}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  DashboardOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${AWS::StackName}-dashboard"
+        Description: Lets the dashboard distribution (and only it) read the dashboard bucket.
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  DashboardBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DashboardBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowOnlyThisDistributionToRead
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "${DashboardBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                "AWS:SourceArn": !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${DashboardDistribution}"
+
+  DashboardHeaders:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name: !Sub "${AWS::StackName}-dashboard-headers"
+        Comment: Browser security headers for the dashboard.
+        SecurityHeadersConfig:
+          StrictTransportSecurity:
+            AccessControlMaxAgeSec: 31536000
+            IncludeSubdomains: false
+            Override: true
+          ContentTypeOptions:
+            Override: true
+          FrameOptions:
+            FrameOption: DENY
+            Override: true
+          ReferrerPolicy:
+            ReferrerPolicy: no-referrer
+            Override: true
+          # The page may load only its own files and talk only to its own origin, the API
+          # and the raw bucket (uploads). The API host is a pattern (any API Gateway in this
+          # region) because naming this stack's API would make the template circular
+          # (API -> Lambda -> raw bucket -> distribution -> this policy). 'unsafe-inline' for
+          # styles only: the charts set inline style attributes. No inline scripts.
+          ContentSecurityPolicy:
+            Override: true
+            ContentSecurityPolicy: !Sub >-
+              default-src 'none';
+              script-src 'self';
+              style-src 'self' 'unsafe-inline';
+              img-src 'self' data:;
+              connect-src 'self' https://*.execute-api.${AWS::Region}.amazonaws.com https://${AWS::StackName}-raw-${AWS::AccountId}-${AWS::Region}.s3.${AWS::Region}.amazonaws.com;
+              base-uri 'none';
+              form-action 'none';
+              frame-ancestors 'none'
+
+  DashboardDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub "${AWS::StackName} dashboard"
+        DefaultRootObject: index.html
+        PriceClass: PriceClass_100 # North America and Europe edges only: cheapest
+        HttpVersion: http2
+        IPV6Enabled: true
+        Origins:
+          - Id: dashboard-bucket
+            DomainName: !GetAtt DashboardBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt DashboardOriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: "" # empty: this origin uses OAC, not the legacy identity
+        DefaultCacheBehavior:
+          TargetOriginId: dashboard-bucket
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6 # AWS managed: CachingOptimized
+          ResponseHeadersPolicyId: !Ref DashboardHeaders
+        CacheBehaviors:
+          # config.json holds the API address and key: never cache it, so a changed key or
+          # address is picked up immediately.
+          - PathPattern: config.json
+            TargetOriginId: dashboard-bucket
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD]
+            Compress: true
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad # AWS managed: CachingDisabled
+            ResponseHeadersPolicyId: !Ref DashboardHeaders
+        # No custom error pages on purpose: the dashboard uses #/ routes, so no path needs a
+        # fallback to index.html, and a missing config.json must stay a clear 403, not an HTML
+        # page the browser would fail to parse as JSON.
+
   # Log groups with a retention (the default is "never expire", which slowly costs money).
   TriggerFunctionLogGroup:
     Type: AWS::Logs::LogGroup
@@ -603,3 +746,12 @@ Outputs:
   TriggerFunctionName:
     Description: Trigger Lambda (reads the queue; check its logs in CloudWatch)
     Value: !Ref TriggerFunction
+  DashboardUrl:
+    Description: Open this address to use the dashboard (HTTPS, served by CloudFront).
+    Value: !Sub "https://${DashboardDistribution.DomainName}"
+  DashboardBucketName:
+    Description: Private bucket holding the dashboard build (filled by scripts/deploy_dashboard.sh)
+    Value: !Ref DashboardBucket
+  DashboardDistributionId:
+    Description: CloudFront distribution of the dashboard (the deploy script invalidates its cache)
+    Value: !Ref DashboardDistribution
