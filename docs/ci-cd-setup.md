@@ -117,5 +117,12 @@ The application stack and the deployed site are not affected; deploys then go ba
   branch protection is recommended.
 - API Gateway and CloudFront name their resources with random ids, so their permissions are limited to the
   kind of resource in this account and region, not to one name.
+- Three SNS actions (`Unsubscribe`, `GetSubscriptionAttributes`, `SetSubscriptionAttributes`) cannot be limited to
+  one topic: AWS offers no resource-level control for them, so they are granted on `*`. They only touch
+  subscriptions, and CloudFormation needs them to replace the alert email address. Creating a queue-to-Lambda
+  mapping is also granted on `*` for the same reason, but it is limited by a condition to this stack's functions.
+- The permission to run the SAM transform (`CreateChangeSet` on the AWS-owned `aws:transform/Serverless-2016-10-31`
+  resource) is copied from the exact error the first CI deploy reported. IAM's policy simulator cannot test it,
+  so only a real deploy proves it.
 - If the container image's repository set changes (a second image function), SAM's companion stack needs
   ECR create rights the deploy role does not have: run that one deploy by hand.
