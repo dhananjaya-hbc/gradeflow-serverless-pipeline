@@ -1,0 +1,423 @@
+/* GradeFlow dashboard. Colours are tokens so light and dark themes share one stylesheet. */
+
+:root {
+  --bg: #f8fafc;
+  --surface: #ffffff;
+  --text: #0f172a;
+  --muted: #475569;
+  --border: #cbd5e1;
+  --accent: #1d4ed8;
+  --accent-text: #ffffff;
+  --focus: #b45309;
+  --row-hover: #f1f5f9;
+  --success-bg: #dcfce7;
+  --success-fg: #14532d;
+  --danger-bg: #fee2e2;
+  --danger-fg: #7f1d1d;
+  --warning-bg: #fef3c7;
+  --warning-fg: #78350f;
+  --info-bg: #dbeafe;
+  --info-fg: #1e3a8a;
+  --neutral-bg: #e2e8f0;
+  --neutral-fg: #1e293b;
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0b1220;
+    --surface: #131c2e;
+    --text: #e2e8f0;
+    --muted: #a3b1c6;
+    --border: #2b3a55;
+    --accent: #7aa7ff;
+    --accent-text: #0b1220;
+    --focus: #fbbf24;
+    --row-hover: #1a2640;
+    --success-bg: #14532d;
+    --success-fg: #dcfce7;
+    --danger-bg: #7f1d1d;
+    --danger-fg: #fee2e2;
+    --warning-bg: #78350f;
+    --warning-fg: #fef3c7;
+    --info-bg: #1e3a8a;
+    --info-fg: #dbeafe;
+    --neutral-bg: #334155;
+    --neutral-fg: #e2e8f0;
+    color-scheme: dark;
+  }
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+h1 {
+  font-size: 1.6rem;
+  margin: 0 0 0.5rem;
+}
+h2 {
+  font-size: 1.25rem;
+  margin: 2rem 0 0.75rem;
+}
+h3 {
+  font-size: 1.05rem;
+  margin: 0 0 0.5rem;
+}
+
+a {
+  color: var(--accent);
+}
+
+:focus-visible {
+  outline: 3px solid var(--focus);
+  outline-offset: 2px;
+}
+
+main {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 1.25rem 16px 3rem;
+}
+main:focus {
+  outline: none; /* focus lands here from the skip link; it is not a control */
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+.skip-link {
+  position: absolute;
+  left: 8px;
+  top: -4rem;
+  z-index: 10;
+  padding: 0.5rem 0.75rem;
+  background: var(--accent);
+  color: var(--accent-text);
+  border-radius: 6px;
+}
+.skip-link:focus {
+  top: 8px;
+}
+
+/* Header */
+.site-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 1.5rem;
+  padding: 0.75rem 16px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+}
+.brand {
+  font-weight: 700;
+  font-size: 1.15rem;
+  text-decoration: none;
+  color: var(--text);
+}
+.site-header nav {
+  display: flex;
+  gap: 0.25rem;
+}
+.site-header nav a {
+  padding: 0.35rem 0.75rem;
+  border-radius: 6px;
+  text-decoration: none;
+  color: var(--muted);
+}
+.site-header nav a[aria-current="page"] {
+  background: var(--info-bg);
+  color: var(--info-fg);
+  font-weight: 600;
+}
+
+/* Controls */
+button,
+select,
+input[type="search"] {
+  font: inherit;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.4rem 0.75rem;
+}
+button {
+  cursor: pointer;
+  min-height: 2.5rem;
+}
+button:hover:not(:disabled) {
+  background: var(--row-hover);
+}
+button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.page-title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 1rem;
+  margin-bottom: 0.25rem;
+}
+.page-title h1 {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.page-title button {
+  margin-left: auto;
+}
+
+.muted {
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+.hint {
+  padding: 0.5rem 0.75rem;
+  background: var(--info-bg);
+  color: var(--info-fg);
+  border-radius: 6px;
+}
+
+/* Status badges: the words carry the meaning, the colour only helps */
+.badge {
+  display: inline-block;
+  padding: 0.1rem 0.6rem;
+  border-radius: 999px;
+  font-size: 0.85rem;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.badge-success {
+  background: var(--success-bg);
+  color: var(--success-fg);
+}
+.badge-danger {
+  background: var(--danger-bg);
+  color: var(--danger-fg);
+}
+.badge-warning {
+  background: var(--warning-bg);
+  color: var(--warning-fg);
+}
+.badge-info {
+  background: var(--info-bg);
+  color: var(--info-fg);
+}
+.badge-neutral {
+  background: var(--neutral-bg);
+  color: var(--neutral-fg);
+}
+
+/* Messages */
+.error-box,
+.success-box {
+  margin: 1rem 0;
+  padding: 0.75rem 1rem;
+  border-radius: 8px;
+  border: 1px solid currentColor;
+}
+.error-box {
+  background: var(--danger-bg);
+  color: var(--danger-fg);
+}
+.success-box {
+  background: var(--success-bg);
+  color: var(--success-fg);
+}
+.error-box p,
+.success-box p {
+  margin: 0.4rem 0;
+}
+.error-box button,
+.success-box button {
+  color: inherit;
+  background: transparent;
+  border-color: currentColor;
+}
+.loading {
+  color: var(--muted);
+}
+
+/* Tables */
+.table-scroll {
+  overflow-x: auto;
+  margin: 0.5rem 0 1rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+table {
+  width: 100%;
+  border-collapse: collapse;
+}
+th,
+td {
+  padding: 0.55rem 0.75rem;
+  text-align: left;
+  vertical-align: top;
+  border-bottom: 1px solid var(--border);
+}
+thead th {
+  font-size: 0.85rem;
+  color: var(--muted);
+  white-space: nowrap;
+}
+tbody tr:last-child td {
+  border-bottom: 0;
+}
+tbody tr:hover {
+  background: var(--row-hover);
+}
+.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* Upload */
+.dropzone {
+  margin: 1rem 0;
+  padding: 2rem 1rem;
+  text-align: center;
+  background: var(--surface);
+  border: 2px dashed var(--border);
+  border-radius: 12px;
+}
+.dropzone.dragging {
+  border-color: var(--accent);
+  background: var(--info-bg);
+}
+progress {
+  width: min(100%, 20rem);
+  vertical-align: middle;
+}
+
+/* Recharts draws its own text, grid and tooltip with fixed colours: use the theme instead.
+   !important is needed only for the tooltip and legend, whose colours are inline styles. */
+.recharts-text,
+.recharts-cartesian-axis-tick-value {
+  fill: var(--muted);
+}
+.recharts-cartesian-grid line {
+  stroke: var(--border);
+}
+.recharts-default-tooltip {
+  background-color: var(--surface) !important;
+  border-color: var(--border) !important;
+}
+.recharts-tooltip-label,
+.recharts-tooltip-item {
+  color: var(--text) !important;
+}
+.recharts-legend-item-text {
+  color: var(--text) !important;
+}
+
+/* Dataset detail */
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(10.5rem, 1fr));
+  gap: 0.75rem;
+  margin: 1rem 0;
+}
+.card {
+  padding: 0.75rem 1rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.card dt {
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+.card dd {
+  margin: 0.1rem 0 0;
+  font-size: 1.6rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+.card small {
+  color: var(--muted);
+}
+
+figure {
+  margin: 1.5rem 0;
+  padding: 1rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+figcaption {
+  font-weight: 600;
+  margin-bottom: 0.5rem;
+}
+.chart-data {
+  margin-top: 0.5rem;
+}
+.chart-data summary {
+  cursor: pointer;
+  color: var(--accent);
+}
+
+.student-tables {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));
+  gap: 1rem;
+  margin: 1.5rem 0;
+}
+
+.row-errors {
+  padding-left: 1.25rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.9rem;
+  overflow-wrap: anywhere;
+}
+
+.filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem 1.5rem;
+  margin-bottom: 0.75rem;
+}
+
+@media (max-width: 40rem) {
+  h1 {
+    font-size: 1.35rem;
+  }
+  .card dd {
+    font-size: 1.35rem;
+  }
+  th,
+  td {
+    padding: 0.5rem;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation: none !important;
+    transition: none !important;
+    scroll-behavior: auto !important;
+  }
+}
