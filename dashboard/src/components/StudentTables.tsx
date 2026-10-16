@@ -1,5 +1,6 @@
 import type { StatsResponse, StudentAverage } from "../api/types";
 import { formatNumber } from "../lib/format";
+import { TableScroll } from "./TableScroll";
 
 function StudentTable({ title, students }: { title: string; students: StudentAverage[] }) {
   return (
@@ -8,6 +9,7 @@ function StudentTable({ title, students }: { title: string; students: StudentAve
       {students.length === 0 ? (
         <p>None.</p>
       ) : (
+        <TableScroll label={title}>
         <table>
           <thead>
             <tr>
@@ -26,6 +28,7 @@ function StudentTable({ title, students }: { title: string; students: StudentAve
             ))}
           </tbody>
         </table>
+        </TableScroll>
       )}
     </div>
   );
@@ -42,6 +45,7 @@ export function StudentTables({ stats }: { stats: StatsResponse }) {
         {classes.length === 0 ? (
           <p>None.</p>
         ) : (
+          <TableScroll label="Class averages">
           <table>
             <thead>
               <tr>
@@ -58,6 +62,7 @@ export function StudentTables({ stats }: { stats: StatsResponse }) {
               ))}
             </tbody>
           </table>
+          </TableScroll>
         )}
       </div>
     </div>
