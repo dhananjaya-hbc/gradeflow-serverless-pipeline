@@ -11,11 +11,18 @@ from gradeflow.application.pipeline_state import PipelineState
 from gradeflow.application.pipeline_steps import RejectDataset
 from gradeflow.infrastructure.config import load_reject_config
 from gradeflow.infrastructure.dynamodb_repository import DynamoDbDatasetRepository
-from gradeflow.infrastructure.observability import logger, with_logging
+from gradeflow.infrastructure.observability import (
+    MetricName,
+    logger,
+    record_metric,
+    with_logging,
+    with_metrics,
+)
 from gradeflow.infrastructure.s3_quarantine import S3Quarantine
 
 
 @with_logging
+@with_metrics
 def handler(event: dict[str, Any], context: object) -> dict[str, Any]:
     """Lambda entry point."""
     return process(event, _build_step())
@@ -38,8 +45,10 @@ def process(event: dict[str, Any], step: RejectDataset) -> dict[str, Any]:
         error_message=meta.error_message,
         quarantined=meta.quarantine_key is not None,
     )
-    return {
+    result = {
         "dataset_id": meta.dataset_id,
         "status": meta.status.value,
         "error_message": meta.error_message,
     }
+    record_metric(MetricName.DATASETS_FAILED)  # last, after everything succeeded
+    return result
