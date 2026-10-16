@@ -340,6 +340,55 @@ rounded to 2 decimals. Results for the default sample file (seed 42):
 | Students / classes | 60 students; `10-A` 62.11, `10-B` 62.75 |
 | Subject/term items | 15 (5 subjects × 3 terms) |
 
+### Permissions (IAM review)
+
+Every function has its own role, and each may do exactly what its step does, on exactly the keys it
+touches. `tests/unit/test_iam_least_privilege.py` pins this on the template **as SAM expands it** (SAM
+adds some policies by itself, so the YAML alone does not show the real roles).
+
+| Role | May do | On |
+|---|---|---|
+| Trigger | read; list; read and write items; start a run; receive, delete and inspect messages | raw `uploads/*`; the raw bucket (list only); the table; the state machine; the upload queue only |
+| Validate | read; list; write | raw `uploads/*`; the raw bucket (list only); processed `work/*` |
+| Clean | read; write | processed `work/*`; processed `processed/*` |
+| Stats | read only | processed `processed/*` |
+| Anomalies | read; write | processed `processed/*`; processed `work/*` |
+| Store | read; write, query and delete items | processed `work/*`; the table |
+| Fail | read (the copy's source); write; write items | raw `uploads/*`; quarantine `quarantine/*`; the table |
+| API | read items; sign upload forms | the table and its index (no scan, no writes); raw `uploads/*` (write, only through signed forms) |
+| State machine | invoke the six steps; publish | those six functions by exact ARN; the alert topic |
+| CloudFront | read | the dashboard bucket, and only for that one distribution |
+| CloudWatch alarms | publish | the alert topic, only alarms of this stack |
+
+What the review removed:
+
+- **The Trigger's managed SQS policy.** SAM attaches AWS's `AWSLambdaSQSQueueExecutionRole` for an `Events: SQS`
+  entry; it allows receiving from and deleting on **every queue in the account**. The queue is now connected
+  by an explicit event source mapping and the Trigger has three SQS actions on the upload queue only. (The
+  mapping keeps the logical ID SAM generated, so the deploy updates it in place: a new ID would create a second
+  mapping first, which Lambda refuses.)
+- **Unused S3 actions** that SAM's `S3ReadPolicy` and `S3WritePolicy` templates include:
+  `s3:PutLifecycleConfiguration` (a compromised function could change when files are deleted), `s3:PutObjectAcl`,
+  `s3:GetBucketLocation`, `s3:GetObjectVersion` and `s3:GetLifecycleConfiguration`.
+- **Whole-bucket access.** Each step now reaches one key prefix (`uploads/`, `work/`, `processed/`, `quarantine/`)
+  and nothing else in the bucket.
+- **A name-prefix wildcard** in the state machine's invoke permission (`function:<name>*`, from SAM's
+  `LambdaInvokePolicy`). It now lists the six functions' exact ARNs.
+- **Plain HTTP.** Every bucket has a policy that refuses requests not made over HTTPS.
+
+Deliberately left as it is, and why:
+
+- **`AWSLambdaBasicExecutionRole`** (AWS's standard policy) on every function: it lets a function write log
+  lines, but to any log group in the account, not only its own. Scoping it needs a hand-written role per
+  function; the risk is low (it cannot read or change anything), so it was kept and documented.
+- **`s3:ListBucket` on the raw bucket** for the Trigger and Validate. Without it S3 answers "access denied" for a
+  missing file instead of "not found", which would make a bad upload harder to diagnose. It only reveals key names.
+- **Table-wide DynamoDB access** for the Trigger, Store and Fail (exact actions, no `Scan`, no
+  `UpdateItem`). Limiting them to key prefixes with `dynamodb:LeadingKeys` conditions was judged more complexity
+  than it is worth for one table with one owner.
+- **The API key** in the dashboard is public by design (see Dashboard), so the API's reach is capped by what its
+  role can do (read-only on the table), not by the key.
+
 ## Code architecture
 
 The Python code follows **clean architecture**. Dependencies only point inward:
