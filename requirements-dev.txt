@@ -7,3 +7,4 @@ pyarrow==25.0.1  # Parquet engine; Lambda gets it from the AWS SDK for pandas la
 boto3==1.40.39
 pyyaml==6.0.3  # tests read template.yaml
 moto[s3,dynamodb,stepfunctions]==5.1.13
+aws-lambda-powertools==3.36.0  # structured logs and metrics; the zip Lambdas get it from src/requirements.txt
