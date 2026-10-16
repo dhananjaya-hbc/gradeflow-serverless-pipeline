@@ -1,0 +1,49 @@
+# Dependabot proposes updates as pull requests; it never merges anything. CI runs on each one.
+# Python and npm packages are pinned to exact versions on purpose (the Lambda code, the container
+# image and the tests must agree), so an update shows up as a diff of those pins.
+#
+# The Lambda container's base image (public.ecr.aws/lambda/python:3.12) and the Python version are
+# not tracked here: they follow the Lambda runtime, and are changed by hand together with template.yaml.
+
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"
+    groups:
+      github-actions:
+        patterns: ["*"]
+
+  # One pull request for all of Python, so versions that must match (the dev requirements, the zip
+  # Lambdas' src/requirements.txt and the container's requirements) are bumped together.
+  - package-ecosystem: pip
+    directories:
+      - /
+      - /src
+      - /docker/anomalies
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "build"
+    groups:
+      python:
+        patterns: ["*"]
+
+  - package-ecosystem: npm
+    directory: /dashboard
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "build"
+    groups:
+      dashboard:
+        patterns: ["*"]
