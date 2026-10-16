@@ -1,0 +1,4 @@
+{
+  "apiUrl": "https://YOUR-API-ID.execute-api.ap-south-1.amazonaws.com/v1",
+  "apiKey": "paste-the-api-key-value-here"
+}
