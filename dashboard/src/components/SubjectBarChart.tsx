@@ -2,6 +2,7 @@ import { Bar, BarChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxi
 import type { SubjectTermStats } from "../api/types";
 import { subjectAverages } from "../lib/charts";
 import { formatCount, formatNumber, formatPercent } from "../lib/format";
+import { BAR_COLOR } from "../lib/palette";
 import { ChartData } from "./ChartData";
 
 export function SubjectBarChart({ groups }: { groups: SubjectTermStats[] }) {
@@ -17,7 +18,7 @@ export function SubjectBarChart({ groups }: { groups: SubjectTermStats[] }) {
             <XAxis dataKey="subject" />
             <YAxis domain={[0, 100]} />
             <Tooltip formatter={(value) => formatNumber(Number(value))} />
-            <Bar dataKey="average" name="Average" fill="#2563eb" />
+            <Bar dataKey="average" name="Average" fill={BAR_COLOR} />
           </BarChart>
         </ResponsiveContainer>
       </div>
