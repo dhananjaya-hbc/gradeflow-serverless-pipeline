@@ -178,3 +178,161 @@ def test_the_ci_python_and_the_function_runtime_agree() -> None:
     assert "Runtime: python3.12" in template
     requires = re.search(r'requires-python = ">=(\d+\.\d+)"', (ROOT / "pyproject.toml").read_text())
     assert requires and requires.group(1) == "3.12"
+
+
+# --- the deploy job -------------------------------------------------------------------------------
+
+DEPLOY = JOBS["deploy"]
+DEPLOY_STEPS = DEPLOY["steps"]
+SETUP_DOC = (ROOT / "docs" / "ci-cd-setup.md").read_text()
+
+
+def deploy_step(name_part: str) -> dict[str, Any]:
+    (found,) = [s for s in DEPLOY_STEPS if name_part in s.get("name", s.get("uses", ""))]
+    return found
+
+
+def test_the_deploy_job_runs_only_for_a_push_to_main_after_every_check_passed() -> None:
+    assert DEPLOY["needs"] == ["python", "dashboard", "template"]
+    assert DEPLOY["if"] == "github.event_name == 'push' && github.ref == 'refs/heads/main'"
+
+
+def test_the_deploy_job_builds_the_arm_image_on_an_arm_runner() -> None:
+    assert DEPLOY["runs-on"] == "ubuntu-24.04-arm"
+    assert DEPLOY["timeout-minutes"] <= 60
+
+
+def test_only_the_deploy_job_can_ask_github_for_an_identity_token() -> None:
+    assert DEPLOY["permissions"] == {"contents": "read", "id-token": "write"}
+    others = [name for name, job in JOBS.items() if name != "deploy" and "permissions" in job]
+    assert others == []
+    assert "id-token" not in str(CI["permissions"])
+
+
+def test_deploys_never_overlap_and_a_running_deploy_is_never_cancelled() -> None:
+    assert DEPLOY["concurrency"] == {"group": "deploy-aws", "cancel-in-progress": False}
+
+
+def test_the_aws_login_uses_oidc_with_the_deploy_role_and_nothing_long_lived() -> None:
+    login = deploy_step("aws-actions/configure-aws-credentials")
+    assert login["with"] == {
+        "role-to-assume": "${{ vars.AWS_DEPLOY_ROLE_ARN }}",
+        "aws-region": "${{ vars.AWS_REGION }}",
+        "role-session-name": "github-deploy-${{ github.run_id }}",
+        "mask-aws-account-id": True,
+    }
+
+
+def test_the_steps_run_in_the_order_that_makes_a_deploy_safe() -> None:
+    labels = [s.get("name", s.get("uses", "")).split("@")[0] for s in DEPLOY_STEPS]
+    order = [
+        "Check the deploy variables are set",
+        "actions/checkout",
+        "aws-actions/configure-aws-credentials",
+        "Build and deploy the stack",
+        "Publish the dashboard",
+        "Smoke test the deployed site",
+    ]
+    positions = [labels.index(step) for step in order]
+    assert positions == sorted(positions)
+    assert labels[0] == "Check the deploy variables are set"  # before anything else can fail oddly
+    assert labels[-1] == "Smoke test the deployed site"  # a broken site turns the run red
+
+
+def test_the_deploy_runs_the_tested_scripts_not_inline_commands() -> None:
+    assert deploy_step("Build and deploy the stack")["run"] == "scripts/ci_deploy.sh"
+    assert deploy_step("Publish the dashboard")["run"] == "scripts/deploy_dashboard.sh"
+    smoke = deploy_step("Smoke test the deployed site")["run"]
+    assert 'python3 scripts/smoke_test.py --dashboard-url "$DASHBOARD_URL"' in smoke
+    for script in ("ci_deploy.sh", "deploy_dashboard.sh", "smoke_test.py"):
+        assert (ROOT / "scripts" / script).exists()
+    for script in ("ci_deploy.sh", "deploy_dashboard.sh"):
+        assert (ROOT / "scripts" / script).stat().st_mode & 0o111, f"{script} is not executable"
+
+
+def test_the_smoke_test_asks_the_stack_for_the_dashboard_address_it_just_deployed() -> None:
+    smoke = deploy_step("Smoke test the deployed site")["run"]
+    assert "describe-stacks" in smoke and "DashboardUrl" in smoke
+    assert "$STACK_NAME" in smoke and "$AWS_REGION" in smoke
+
+
+def test_the_deploy_job_uses_the_same_sam_version_as_the_template_job() -> None:
+    def version(job: str) -> str:
+        (setup,) = [s for s in steps(job) if s.get("uses", "").startswith("aws-actions/setup-sam@")]
+        return str(setup["with"]["version"])
+
+    assert version("deploy") == version("template")
+
+
+def test_the_deploy_stack_name_is_the_one_the_project_deploys() -> None:
+    assert DEPLOY["env"]["STACK_NAME"] == "gradeflow"
+    assert 'stack_name = "gradeflow"' in (ROOT / "samconfig.toml").read_text()
+
+
+def test_no_step_may_fail_and_let_the_job_carry_on() -> None:
+    assert "continue-on-error" not in CI_TEXT
+
+
+def test_only_the_deploy_job_touches_aws_variables_or_credentials() -> None:
+    for name in ("python", "dashboard", "template"):
+        text = yaml.safe_dump(JOBS[name])
+        assert "vars." not in text and "configure-aws-credentials" not in text, name
+        assert "id-token" not in text and "AWS_" not in text, name
+
+
+# --- the variables the workflow reads and the guide that tells you to set them -------------------
+
+
+def workflow_variables() -> set[str]:
+    return set(re.findall(r"vars\.([A-Z][A-Z0-9_]*)", CI_TEXT))
+
+
+def test_every_variable_the_workflow_reads_is_explained_in_the_setup_guide() -> None:
+    documented = set(re.findall(r"gh variable set ([A-Z][A-Z0-9_]*)", SETUP_DOC))
+    assert workflow_variables() == documented, workflow_variables() ^ documented
+
+
+def test_the_workflow_reads_only_variables_and_no_stored_secrets() -> None:
+    assert workflow_variables() == {
+        "AWS_DEPLOY_ROLE_ARN",
+        "AWS_CFN_ROLE_ARN",
+        "AWS_REGION",
+        "ALERT_EMAIL",
+        "API_ALLOWED_ORIGIN",
+        "DASHBOARD_DEV_ORIGIN",
+    }
+
+
+def run_check(env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    script = deploy_step("Check the deploy variables are set")["run"]
+    bash = "/bin/bash"
+    return subprocess.run(
+        [bash, "-c", script], env={"PATH": "/usr/bin:/bin", **env}, capture_output=True, text=True
+    )
+
+
+ALL_REQUIRED = {"DEPLOY_ROLE": "arn", "AWS_CFN_ROLE_ARN": "arn", "AWS_REGION": "ap-south-1"}
+
+
+def test_the_variable_check_passes_when_everything_is_set() -> None:
+    assert run_check(ALL_REQUIRED).returncode == 0
+
+
+@pytest.mark.parametrize(
+    ("missing", "named"),
+    [
+        ("DEPLOY_ROLE", "AWS_DEPLOY_ROLE_ARN"),
+        ("AWS_CFN_ROLE_ARN", "AWS_CFN_ROLE_ARN"),
+        ("AWS_REGION", "AWS_REGION"),
+    ],
+)
+def test_the_variable_check_names_the_variable_that_is_missing(missing: str, named: str) -> None:
+    env = {k: v for k, v in ALL_REQUIRED.items() if k != missing}
+    result = run_check(env)
+    assert result.returncode != 0
+    assert named in result.stderr
+    assert "docs/ci-cd-setup.md" in result.stderr
+
+
+def test_an_empty_variable_counts_as_missing() -> None:
+    assert run_check({**ALL_REQUIRED, "AWS_REGION": ""}).returncode != 0
