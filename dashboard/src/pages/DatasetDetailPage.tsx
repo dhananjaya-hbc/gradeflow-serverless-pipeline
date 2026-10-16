@@ -10,11 +10,13 @@ import { SummaryCards } from "../components/SummaryCards";
 import { TermLineChart } from "../components/TermLineChart";
 import { ValidationReport } from "../components/ValidationReport";
 import { useDatasetDetail } from "../hooks/useDatasetDetail";
+import { useTitle } from "../hooks/useTitle";
 import { formatDateTime } from "../lib/format";
 
 export function DatasetDetailPage() {
   const { id = "" } = useParams();
   const { detail, stats, statsError, status, error, autoRefresh, refresh } = useDatasetDetail(useApi(), id);
+  useTitle(detail?.filename ?? (status === "not-found" ? "Not found" : null));
 
   if (status === "loading") return <Loading label="Loading dataset" />;
   if (status === "not-found") {
