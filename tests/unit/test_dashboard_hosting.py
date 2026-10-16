@@ -230,6 +230,10 @@ def test_the_csp_lets_styles_be_inline_but_scripts_never() -> None:
     assert "'unsafe-inline'" not in policy["script-src"]
 
 
+def test_the_csp_allows_fonts_from_the_site_itself_only() -> None:
+    assert csp()["font-src"] == ["'self'"]  # the self-hosted Inter file, never a font CDN
+
+
 # --- uploading from the browser: CORS on the raw bucket ------------------------------------
 
 
