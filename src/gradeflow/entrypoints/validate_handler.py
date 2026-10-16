@@ -3,20 +3,18 @@
 Handler path in template.yaml: gradeflow.entrypoints.validate_handler.handler
 """
 
-import logging
 from functools import cache
 from typing import Any
 
 from gradeflow.application.pipeline_state import PipelineState
 from gradeflow.application.pipeline_steps import ValidateStep
 from gradeflow.infrastructure.config import load_validate_config
+from gradeflow.infrastructure.observability import logger, with_logging
 from gradeflow.infrastructure.s3_artifacts import S3DatasetArtifacts
 from gradeflow.infrastructure.s3_storage import S3FileStorage
 
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
 
-
+@with_logging
 def handler(event: dict[str, Any], context: object) -> dict[str, Any]:
     """Lambda entry point."""
     return process(event, _build_step())
@@ -35,11 +33,15 @@ def _build_step() -> ValidateStep:
 def process(event: dict[str, Any], step: ValidateStep) -> dict[str, Any]:
     state = PipelineState.from_dict(event)
     outcome = step.execute(state)
-    logger.info(
-        "validated dataset %s: valid=%s rows=%d/%d",
-        state.dataset_id,
-        outcome.valid,
-        outcome.valid_rows,
-        outcome.total_rows,
+    # An invalid file is a normal outcome (the Fail step handles it), but worth a WARNING.
+    log = logger.info if outcome.valid else logger.warning
+    log(
+        "validation finished",
+        dataset_id=state.dataset_id,
+        valid=outcome.valid,
+        total_rows=outcome.total_rows,
+        valid_rows=outcome.valid_rows,
+        invalid_rows=outcome.invalid_rows,
+        error_message=outcome.error_message,
     )
     return outcome.to_dict()
