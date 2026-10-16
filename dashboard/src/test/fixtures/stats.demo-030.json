@@ -1,0 +1,239 @@
+{
+  "dataset_id": "demo-030",
+  "status": "COMPLETED",
+  "overall": {
+    "count": 891,
+    "mean": 62.43,
+    "median": 62,
+    "std": 16.12,
+    "min": 14.4,
+    "max": 100,
+    "pass_rate": 78.34
+  },
+  "student_count": 60,
+  "top_students": [
+    {
+      "student_id": "S00034",
+      "student_name": "Malsha Silva",
+      "average": 93.19
+    },
+    {
+      "student_id": "S00047",
+      "student_name": "Pasindu Rathnayake",
+      "average": 89.77
+    },
+    {
+      "student_id": "S00010",
+      "student_name": "Pasindu Silva",
+      "average": 86.2
+    },
+    {
+      "student_id": "S00038",
+      "student_name": "Chamari Herath",
+      "average": 84.99
+    },
+    {
+      "student_id": "S00049",
+      "student_name": "Nimal Jayasinghe",
+      "average": 84.4
+    }
+  ],
+  "bottom_students": [
+    {
+      "student_id": "S00018",
+      "student_name": "Ruwan Silva",
+      "average": 26.28
+    },
+    {
+      "student_id": "S00037",
+      "student_name": "Kasun Gunawardena",
+      "average": 28.99
+    },
+    {
+      "student_id": "S00019",
+      "student_name": "Janith Bandara",
+      "average": 37.49
+    },
+    {
+      "student_id": "S00050",
+      "student_name": "Kasun Rathnayake",
+      "average": 42.01
+    },
+    {
+      "student_id": "S00053",
+      "student_name": "Tharindu Bandara",
+      "average": 42.33
+    }
+  ],
+  "class_averages": {
+    "10-A": 62.11,
+    "10-B": 62.75
+  },
+  "by_subject_term": [
+    {
+      "subject": "English",
+      "term": "T1",
+      "count": 60,
+      "mean": 63.15,
+      "median": 63.75,
+      "std": 15.92,
+      "min": 20.4,
+      "max": 97.3,
+      "pass_rate": 83.33
+    },
+    {
+      "subject": "English",
+      "term": "T2",
+      "count": 58,
+      "mean": 64.21,
+      "median": 62.95,
+      "std": 16.07,
+      "min": 31.3,
+      "max": 100,
+      "pass_rate": 81.03
+    },
+    {
+      "subject": "English",
+      "term": "T3",
+      "count": 59,
+      "mean": 63.29,
+      "median": 64,
+      "std": 17.3,
+      "min": 20.9,
+      "max": 100,
+      "pass_rate": 77.97
+    },
+    {
+      "subject": "History",
+      "term": "T1",
+      "count": 60,
+      "mean": 65.81,
+      "median": 66.75,
+      "std": 15.81,
+      "min": 28.5,
+      "max": 100,
+      "pass_rate": 80
+    },
+    {
+      "subject": "History",
+      "term": "T2",
+      "count": 59,
+      "mean": 67.45,
+      "median": 66.6,
+      "std": 14.96,
+      "min": 31.7,
+      "max": 100,
+      "pass_rate": 89.83
+    },
+    {
+      "subject": "History",
+      "term": "T3",
+      "count": 58,
+      "mean": 67.6,
+      "median": 68.6,
+      "std": 15.61,
+      "min": 27.7,
+      "max": 100,
+      "pass_rate": 84.48
+    },
+    {
+      "subject": "ICT",
+      "term": "T1",
+      "count": 59,
+      "mean": 62.67,
+      "median": 62.3,
+      "std": 15.36,
+      "min": 20.7,
+      "max": 100,
+      "pass_rate": 81.36
+    },
+    {
+      "subject": "ICT",
+      "term": "T2",
+      "count": 60,
+      "mean": 63.77,
+      "median": 60.85,
+      "std": 17.62,
+      "min": 14.4,
+      "max": 100,
+      "pass_rate": 76.67
+    },
+    {
+      "subject": "ICT",
+      "term": "T3",
+      "count": 60,
+      "mean": 62.15,
+      "median": 60.15,
+      "std": 16.04,
+      "min": 22.3,
+      "max": 100,
+      "pass_rate": 80
+    },
+    {
+      "subject": "Maths",
+      "term": "T1",
+      "count": 60,
+      "mean": 59.97,
+      "median": 60.7,
+      "std": 16.24,
+      "min": 19.2,
+      "max": 100,
+      "pass_rate": 76.67
+    },
+    {
+      "subject": "Maths",
+      "term": "T2",
+      "count": 60,
+      "mean": 59.26,
+      "median": 58.6,
+      "std": 15.05,
+      "min": 19.1,
+      "max": 93.1,
+      "pass_rate": 73.33
+    },
+    {
+      "subject": "Maths",
+      "term": "T3",
+      "count": 61,
+      "mean": 59.71,
+      "median": 59.3,
+      "std": 16.07,
+      "min": 23.6,
+      "max": 96.7,
+      "pass_rate": 75.41
+    },
+    {
+      "subject": "Science",
+      "term": "T1",
+      "count": 60,
+      "mean": 58.49,
+      "median": 56.95,
+      "std": 16.06,
+      "min": 28.5,
+      "max": 93.1,
+      "pass_rate": 65
+    },
+    {
+      "subject": "Science",
+      "term": "T2",
+      "count": 59,
+      "mean": 59.08,
+      "median": 60,
+      "std": 15.67,
+      "min": 24.2,
+      "max": 87.4,
+      "pass_rate": 74.58
+    },
+    {
+      "subject": "Science",
+      "term": "T3",
+      "count": 58,
+      "mean": 60.08,
+      "median": 59.5,
+      "std": 15.76,
+      "min": 30.8,
+      "max": 99.3,
+      "pass_rate": 75.86
+    }
+  ]
+}
