@@ -14,7 +14,6 @@ Routes (API Gateway has already checked the API key before this runs):
 import base64
 import binascii
 import json
-import logging
 from functools import cache
 from typing import Any
 
@@ -29,10 +28,8 @@ from gradeflow.application.queries import (
 )
 from gradeflow.infrastructure.config import load_api_config
 from gradeflow.infrastructure.dynamodb_reader import DynamoDbDatasetReader
+from gradeflow.infrastructure.observability import logger, with_logging
 from gradeflow.infrastructure.s3_upload_signer import S3UploadSigner
-
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
 
 MAX_BODY_BYTES = 4096  # the only body we read is {"filename": "..."}
 
@@ -76,14 +73,16 @@ class Api:
         except QueryError as exc:
             status, body = exc.status, _error(exc.code, exc.message)
         except Exception:
-            logger.exception("unexpected error on %s %s", method, resource)
+            logger.exception("unexpected error", method=method, resource=resource)
             status, body = 500, _error("internal_error", "something went wrong on our side")
         try:
             text = json.dumps(body, allow_nan=False)  # NaN is not valid JSON: refuse, not emit
         except ValueError:
-            logger.exception("response for %s %s is not valid JSON", method, resource)
+            logger.exception("response is not valid JSON", method=method, resource=resource)
             status, text = 500, json.dumps(_error("internal_error", "something went wrong"))
-        logger.info("%s %s -> %d", method, event.get("path", resource), status)
+        logger.info(
+            "request handled", method=method, path=event.get("path", resource), status=status
+        )
         return {"statusCode": status, "headers": self._headers(extra_headers), "body": text}
 
     # --- routing ---------------------------------------------------------------------
@@ -175,6 +174,7 @@ def _json_body(event: dict[str, Any]) -> dict[str, Any]:
 # --- Lambda wiring -------------------------------------------------------------------
 
 
+@with_logging
 def handler(event: dict[str, Any], context: object) -> dict[str, Any]:
     """Lambda entry point."""
     return _build_api().handle(event)
