@@ -9,10 +9,12 @@ does for real. Nothing here talks to AWS.
 """
 
 import copy
+import os
 import re
 from functools import cache
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 from samtranslator.parser.parser import Parser
 from samtranslator.translator.translator import Translator
@@ -42,7 +44,11 @@ def _expanded() -> dict[str, Any]:
         if resource["Type"] == "AWS::Serverless::StateMachine":
             properties["DefinitionUri"] = "s3://bucket/definition.json"
     defaults = {name: p.get("Default", "") for name, p in template.get("Parameters", {}).items()}
-    return Translator(MANAGED_POLICIES, Parser()).translate(template, defaults)
+    # The translator reads the AWS region from the environment to build ARNs. A laptop has one in
+    # ~/.aws/config; a CI runner does not. Give it one, for this call only, so the tests behave the
+    # same everywhere (and never depend on, or touch, a real AWS configuration).
+    with mock.patch.dict(os.environ, {"AWS_DEFAULT_REGION": "ap-south-1"}):
+        return Translator(MANAGED_POLICIES, Parser()).translate(template, defaults)
 
 
 def expanded_template() -> dict[str, Any]:
