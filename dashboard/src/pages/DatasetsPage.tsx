@@ -3,10 +3,13 @@ import { useApi } from "../api/context";
 import { ErrorBox } from "../components/ErrorBox";
 import { Loading } from "../components/Loading";
 import { StatusBadge } from "../components/StatusBadge";
+import { TableScroll } from "../components/TableScroll";
 import { useDatasetList } from "../hooks/useDatasetList";
+import { useTitle } from "../hooks/useTitle";
 import { formatCount, formatDateTime } from "../lib/format";
 
 export function DatasetsPage() {
+  useTitle("Datasets");
   const list = useDatasetList(useApi());
 
   if (list.status === "loading") return <Loading label="Loading datasets" />;
@@ -34,6 +37,7 @@ export function DatasetsPage() {
           No datasets yet. <Link to="/upload">Upload a file</Link> to get started.
         </p>
       ) : (
+        <TableScroll label="Datasets">
         <table>
           <thead>
             <tr>
@@ -63,6 +67,7 @@ export function DatasetsPage() {
             ))}
           </tbody>
         </table>
+        </TableScroll>
       )}
 
       {list.hasMore && (
