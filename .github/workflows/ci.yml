@@ -1,9 +1,11 @@
-# Checks every push and pull request: Python lint and tests, the dashboard, and the SAM template.
-# (A deploy job is added to this file in a later step; it will run on pushes to main only.)
+# Checks every push and pull request (Python lint and tests, the dashboard, the SAM template), and
+# deploys to AWS from the main branch once all of them pass.
+#
+# Only the deploy job has any AWS access. It logs in with OIDC (a short-lived role, no stored keys):
+# see docs/ci-cd-setup.md for the one-time setup and the repository variables it reads.
 #
 # Actions are pinned to a full commit SHA, with the version in a comment, so a moved tag cannot
-# change what runs here. Dependabot proposes updates. No AWS access is needed for any of these
-# jobs: the tests use moto and fakes, and `sam validate` works without credentials.
+# change what runs here. Dependabot proposes updates.
 
 name: CI
 
@@ -80,3 +82,65 @@ jobs:
         with:
           version: 1.166.2 # the version the template was developed and linted with
       - run: sam validate --lint --region ap-south-1
+
+  deploy:
+    name: Deploy to AWS (main only)
+    needs: [python, dashboard, template]
+    # Never for a pull request, a fork or another branch: only a push to main, after the checks.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04-arm # builds the arm64 container image natively (public repositories: free)
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write # lets this job ask GitHub for the identity token AWS checks
+    # One deploy at a time. A second push waits; it never cancels a deploy that is half done.
+    concurrency:
+      group: deploy-aws
+      cancel-in-progress: false
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      AWS_CFN_ROLE_ARN: ${{ vars.AWS_CFN_ROLE_ARN }}
+      ALERT_EMAIL: ${{ vars.ALERT_EMAIL }}
+      API_ALLOWED_ORIGIN: ${{ vars.API_ALLOWED_ORIGIN }}
+      DASHBOARD_DEV_ORIGIN: ${{ vars.DASHBOARD_DEV_ORIGIN }}
+      STACK_NAME: gradeflow
+    steps:
+      - name: Check the deploy variables are set
+        env:
+          DEPLOY_ROLE: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+        run: |
+          : "${DEPLOY_ROLE:?Set the repository variable AWS_DEPLOY_ROLE_ARN (see docs/ci-cd-setup.md)}"
+          : "${AWS_CFN_ROLE_ARN:?Set the repository variable AWS_CFN_ROLE_ARN (see docs/ci-cd-setup.md)}"
+          : "${AWS_REGION:?Set the repository variable AWS_REGION (see docs/ci-cd-setup.md)}"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+      - uses: aws-actions/setup-sam@89ddb14d60e682855e3fea4be85b3c56485de310 # v3
+        with:
+          version: 1.166.2 # the same version the template job lints with
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: github-deploy-${{ github.run_id }}
+          mask-aws-account-id: true
+      - name: Build and deploy the stack
+        run: scripts/ci_deploy.sh
+      - name: Publish the dashboard
+        run: scripts/deploy_dashboard.sh
+      - name: Smoke test the deployed site
+        run: |
+          DASHBOARD_URL=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$AWS_REGION" --query "Stacks[0].Outputs[?OutputKey=='DashboardUrl'].OutputValue" --output text)
+          python3 scripts/smoke_test.py --dashboard-url "$DASHBOARD_URL"
+          {
+            echo "### Deployed ${GITHUB_SHA::7} to $STACK_NAME"
+            echo "- Dashboard: $DASHBOARD_URL"
+          } >> "$GITHUB_STEP_SUMMARY"
