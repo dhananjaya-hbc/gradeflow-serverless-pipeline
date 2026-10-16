@@ -2,6 +2,7 @@
 
 import json
 import re
+import warnings
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,7 @@ from gradeflow.infrastructure.observability import (
     metrics,
     record_metric,
     with_logging,
+    with_metrics,
 )
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -74,6 +76,92 @@ def test_only_names_from_the_list_are_accepted() -> None:
     with pytest.raises(AttributeError):
         record_metric("SomethingMadeUp")  # type: ignore[arg-type]
     metrics.clear_metrics()
+
+
+# --- publishing metrics from a handler -----------------------------------------------------------
+
+
+def emf_lines(capsys: pytest.CaptureFixture) -> list[dict]:
+    return [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
+
+
+def test_what_a_handler_recorded_is_published_once_when_it_returns(capsys) -> None:
+    @with_metrics
+    def handler(event: dict, context: object) -> str:
+        record_metric(MetricName.DATASETS_COMPLETED)
+        record_metric(MetricName.ANOMALIES_FOUND, 4)
+        return "done"
+
+    assert handler({}, None) == "done"
+    (line,) = emf_lines(capsys)
+    assert line["DatasetsCompleted"] == [1.0]
+    assert line["AnomaliesFound"] == [4.0]
+    names = [m["Name"] for m in line["_aws"]["CloudWatchMetrics"][0]["Metrics"]]
+    assert names == ["DatasetsCompleted", "AnomaliesFound"]
+
+
+def test_a_handler_that_recorded_nothing_publishes_nothing_and_warns_about_nothing(
+    capsys,
+) -> None:
+    @with_metrics
+    def handler(event: dict, context: object) -> None:
+        return None
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # Powertools' own decorator would warn here
+        handler({}, None)
+    assert capsys.readouterr().out == ""
+
+
+def test_counts_are_thrown_away_when_the_handler_fails_because_it_will_be_retried(
+    capsys,
+) -> None:
+    @with_metrics
+    def handler(event: dict, context: object) -> None:
+        record_metric(MetricName.DATASETS_COMPLETED)
+        raise RuntimeError("crashed after counting")
+
+    with pytest.raises(RuntimeError, match="crashed after counting"):
+        handler({}, None)
+    assert capsys.readouterr().out == ""
+    assert not metrics.metric_set  # and nothing is left to leak into the next call
+
+
+def test_each_call_starts_with_an_empty_queue(capsys) -> None:
+    record_metric(MetricName.ROWS_RECEIVED, 999)  # left over, as if an earlier flush had failed
+
+    @with_metrics
+    def handler(event: dict, context: object) -> None:
+        record_metric(MetricName.ROWS_REJECTED, 2)
+
+    handler({}, None)
+    (line,) = emf_lines(capsys)
+    assert "RowsReceived" not in line
+    assert line["RowsRejected"] == [2.0]
+
+
+def test_a_published_count_is_not_published_again_by_the_next_call(capsys) -> None:
+    @with_metrics
+    def counts(event: dict, context: object) -> None:
+        record_metric(MetricName.DATASETS_FAILED)
+
+    @with_metrics
+    def silent(event: dict, context: object) -> None:
+        return None
+
+    counts({}, None)
+    capsys.readouterr()
+    silent({}, None)
+    assert capsys.readouterr().out == ""
+
+
+def test_the_metrics_decorator_keeps_the_handlers_name() -> None:
+    @with_metrics
+    def my_handler(event: dict, context: object) -> None:
+        """Does the work."""
+
+    assert my_handler.__name__ == "my_handler"
+    assert my_handler.__doc__ == "Does the work."
 
 
 # --- logging -----------------------------------------------------------------------------------
