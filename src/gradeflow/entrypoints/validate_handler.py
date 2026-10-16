@@ -9,12 +9,19 @@ from typing import Any
 from gradeflow.application.pipeline_state import PipelineState
 from gradeflow.application.pipeline_steps import ValidateStep
 from gradeflow.infrastructure.config import load_validate_config
-from gradeflow.infrastructure.observability import logger, with_logging
+from gradeflow.infrastructure.observability import (
+    MetricName,
+    logger,
+    record_metric,
+    with_logging,
+    with_metrics,
+)
 from gradeflow.infrastructure.s3_artifacts import S3DatasetArtifacts
 from gradeflow.infrastructure.s3_storage import S3FileStorage
 
 
 @with_logging
+@with_metrics
 def handler(event: dict[str, Any], context: object) -> dict[str, Any]:
     """Lambda entry point."""
     return process(event, _build_step())
@@ -44,4 +51,9 @@ def process(event: dict[str, Any], step: ValidateStep) -> dict[str, Any]:
         invalid_rows=outcome.invalid_rows,
         error_message=outcome.error_message,
     )
-    return outcome.to_dict()
+    result = outcome.to_dict()
+    # Last, after everything succeeded (see record_metric). Rows were received even when the
+    # file is rejected for having too many bad ones.
+    record_metric(MetricName.ROWS_RECEIVED, outcome.total_rows)
+    record_metric(MetricName.ROWS_REJECTED, outcome.invalid_rows)
+    return result
