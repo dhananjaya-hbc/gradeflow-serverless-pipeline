@@ -2,10 +2,12 @@ import { useRef, useState, type DragEvent } from "react";
 import { Link } from "react-router-dom";
 import { useApi } from "../api/context";
 import { ErrorBox } from "../components/ErrorBox";
+import { useTitle } from "../hooks/useTitle";
 import { useUpload } from "../hooks/useUpload";
 import { MAX_BYTES, formatMb } from "../lib/upload";
 
 export function UploadPage() {
+  useTitle("Upload");
   const { state, start, cancel, reset } = useUpload(useApi());
   const [dragging, setDragging] = useState(false);
   const input = useRef<HTMLInputElement>(null);
