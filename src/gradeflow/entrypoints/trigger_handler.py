@@ -13,15 +13,22 @@ from functools import cache
 from typing import Any
 from urllib.parse import unquote_plus
 
-from gradeflow.application.pipeline_steps import TriggerPipeline, TriggerRequest
+from gradeflow.application.pipeline_steps import TriggerPipeline, TriggerRequest, TriggerStatus
 from gradeflow.infrastructure.config import load_trigger_config
 from gradeflow.infrastructure.dynamodb_repository import DynamoDbDatasetRepository
-from gradeflow.infrastructure.observability import logger, with_logging
+from gradeflow.infrastructure.observability import (
+    MetricName,
+    logger,
+    record_metric,
+    with_logging,
+    with_metrics,
+)
 from gradeflow.infrastructure.s3_storage import S3FileStorage
 from gradeflow.infrastructure.step_functions_starter import StepFunctionsStarter
 
 
 @with_logging
+@with_metrics
 def handler(event: dict[str, Any], context: object) -> dict[str, Any]:
     """Lambda entry point."""
     return process_event(event, _build_use_case())
@@ -51,6 +58,8 @@ def process_event(event: dict[str, Any], use_case: TriggerPipeline) -> dict[str,
         status = use_case.execute(request)
         logger.info("upload processed", dataset_id=request.dataset_id, status=status.value)
         triggered.append({"dataset_id": request.dataset_id, "status": status.value})
+        if status == TriggerStatus.DUPLICATE:
+            record_metric(MetricName.DUPLICATES_SKIPPED)
     return {"triggered": triggered, "skipped": skipped}
 
 
