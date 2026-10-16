@@ -9,3 +9,4 @@ pyyaml==6.0.3  # tests read template.yaml
 moto[s3,dynamodb,stepfunctions]==5.1.13
 aws-lambda-powertools==3.36.0  # structured logs and metrics; the zip Lambdas get it from src/requirements.txt
 aws-sam-translator==1.113.0  # tests expand template.yaml the way `sam deploy` does, to check IAM
+actionlint-py==1.7.12.25  # tests lint the GitHub Actions workflows (downloads the actionlint binary)
