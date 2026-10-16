@@ -422,6 +422,7 @@ RESOURCE_EXCEPTIONS = {
     "LetLambdaEncryptEnvironmentVariablesWithItsDefaultKey": "AWS-managed key, only via Lambda",
     "ManageTheWorkflow": "CloudFormation names it after its logical id (PipelineStateMachine-*)",
     "ReadTheBuildArtifacts": "SAM's artifact bucket, read only",
+    "RunTheSamTransform": "the SAM transform is an AWS-owned resource",
     "ManageTheRestApiKeyAndUsagePlan": "API Gateway uses random ids",
     "ChangeTheDistributionAndItsParts": "CloudFront uses random ids",
 }
@@ -439,6 +440,10 @@ WILDCARD_RESOURCE_ACTIONS = {
     "cloudfront:CreateOriginAccessControl",
     "cloudfront:CreateResponseHeadersPolicy",
     "cloudfront:TagResource",
+    "lambda:CreateEventSourceMapping",  # limited by the function instead (a condition)
+    "sns:Unsubscribe",
+    "sns:GetSubscriptionAttributes",
+    "sns:SetSubscriptionAttributes",
 }
 # The only wildcard actions: reads and writes of a bucket's own settings, never its objects.
 WILDCARD_ACTIONS = {
@@ -467,6 +472,66 @@ def test_every_execution_statement_is_limited_to_the_stacks_name_or_a_documented
             if statement["Sid"] in RESOURCE_EXCEPTIONS:
                 continue
             assert all("${StackName}" in r for r in resources), (statement["Sid"], resources)
+
+
+def test_the_execution_role_may_use_the_sam_transform_and_nothing_else_in_cloudformation() -> None:
+    """The first CI deploy failed with: the execution role "is not authorized to perform:
+    cloudformation:CreateChangeSet on resource:
+    arn:aws:cloudformation:ap-south-1:aws:transform/Serverless-2016-10-31". With a service role,
+    CloudFormation checks that permission on the role. It is needed there, and nothing more."""
+    cloudformation = {(a, r) for a, r, _ in EXEC_ALLOWED if a.startswith("cloudformation:")}
+    assert cloudformation == {
+        (
+            "cloudformation:CreateChangeSet",
+            "arn:aws:cloudformation:${AWS::Region}:aws:transform/Serverless-2016-10-31",
+        )
+    }
+
+
+# Actions IAM cannot limit to a resource. A statement that names an ARN never matches them, so they
+# work only under Resource "*". Granted any other way they are dead: allowed on paper, refused in
+# practice. (Found by running every granted action through IAM's policy simulator against the live
+# role: the SNS subscription actions and CreateEventSourceMapping had been listed under ARNs.)
+NO_RESOURCE_LEVEL_SUPPORT = {
+    "sns:Unsubscribe",
+    "sns:GetSubscriptionAttributes",
+    "sns:SetSubscriptionAttributes",
+    "lambda:CreateEventSourceMapping",
+}
+
+
+def test_actions_without_resource_level_support_are_granted_only_on_star() -> None:
+    for action in NO_RESOURCE_LEVEL_SUPPORT:
+        resources = {r for a, r, _ in EXEC_ALLOWED if a == action}
+        assert resources == {"*"}, f"{action} would never match: {resources}"
+
+
+def test_creating_a_queue_mapping_is_limited_to_the_stacks_functions_by_a_condition() -> None:
+    (statement,) = [
+        s
+        for s in statements("ExecutionComputePolicy")
+        if s["Sid"] == "CreateQueueMappingsForTheStacksFunctions"
+    ]
+    assert statement["Action"] == "lambda:CreateEventSourceMapping"
+    assert statement["Condition"] == {
+        "ArnLike": {
+            "lambda:FunctionArn": {
+                "Sub": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${StackName}-*"
+            }
+        }
+    }
+
+
+def test_the_email_subscription_actions_are_in_their_own_star_statement() -> None:
+    (statement,) = [
+        s for s in statements("ExecutionDataPolicy") if s["Sid"] == "ManageTheEmailSubscription"
+    ]
+    assert set(statement["Action"]) == {
+        "sns:Unsubscribe",
+        "sns:GetSubscriptionAttributes",
+        "sns:SetSubscriptionAttributes",
+    }
+    assert statement["Resource"] == "*"
 
 
 def test_the_documented_exceptions_are_real_statements() -> None:
