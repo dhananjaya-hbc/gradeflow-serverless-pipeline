@@ -744,6 +744,7 @@ Resources:
               default-src 'none';
               script-src 'self';
               style-src 'self' 'unsafe-inline';
+              font-src 'self';
               img-src 'self' data:;
               connect-src 'self' https://*.execute-api.${AWS::Region}.amazonaws.com https://${AWS::StackName}-raw-${AWS::AccountId}-${AWS::Region}.s3.${AWS::Region}.amazonaws.com;
               base-uri 'none';
