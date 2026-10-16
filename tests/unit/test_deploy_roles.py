@@ -613,7 +613,6 @@ S3_NAMES = {
     "GetBucketInventoryConfiguration": "GetInventoryConfiguration",
     "GetBucketMetricsConfiguration": "GetMetricsConfiguration",
     "GetBucketIntelligentTieringConfiguration": "GetIntelligentTieringConfiguration",
-    "ListTagsForResource": "GetBucketTagging",
 }
 HTTP_VERB = {"Create": "POST", "Get": "GET", "Put": "PUT", "Update": "PATCH", "Delete": "DELETE"}
 
@@ -655,6 +654,23 @@ def missing(calls: list[list[str]], grants: list[tuple[str, str, dict[str, Any]]
 def test_the_execution_role_allows_every_call_cloudformation_made_in_the_real_deploys() -> None:
     assert len(OBSERVED["made_by_cloudformation"]) > 100  # the evidence is really there
     assert missing(OBSERVED["made_by_cloudformation"], EXEC_ALLOWED) == []
+
+
+def test_the_execution_role_allows_what_it_was_denied_in_the_first_successful_ci_deploy() -> None:
+    """Real denials, named by IAM itself in the error message (so no guessing which action it was):
+    CloudFormation's read of the dashboard bucket's tags was refused until s3:ListTagsForResource
+    was granted."""
+    denied = OBSERVED["denied_to_the_execution_role_in_the_first_successful_ci_deploy"][
+        "iam_actions"
+    ]
+    assert denied  # the evidence is there
+    assert [a for a in denied if not permits(EXEC_ALLOWED, a)] == []
+
+
+def test_reading_and_writing_bucket_tags_is_limited_to_the_stacks_buckets() -> None:
+    for action in ("s3:ListTagsForResource", "s3:TagResource", "s3:UntagResource"):
+        resources = {r for a, r, _ in EXEC_ALLOWED if a == action}
+        assert resources == {"arn:aws:s3:::${StackName}-*"}, action
 
 
 def test_the_execution_role_allows_what_lambda_does_for_the_caller() -> None:
@@ -772,6 +788,8 @@ REQUIRED_FOR_TYPE: dict[str, list[str]] = {
         "s3:CreateBucket",
         "s3:DeleteBucket",
         "s3:PutBucketTagging",
+        "s3:TagResource",
+        "s3:ListTagsForResource",
         "s3:PutLifecycleConfiguration",
         "s3:PutEncryptionConfiguration",
         "s3:PutBucketPublicAccessBlock",
