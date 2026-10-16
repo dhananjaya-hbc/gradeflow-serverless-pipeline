@@ -383,6 +383,11 @@ Resources:
               - s3:PutBucket*
               - s3:Get*Configuration
               - s3:Put*Configuration
+              # Reading and writing a bucket's tags goes through a separate API with its own actions
+              # (found in CloudTrail: "not authorized to perform: s3:ListTagsForResource").
+              - s3:ListTagsForResource
+              - s3:TagResource
+              - s3:UntagResource
             Resource: !Sub "arn:aws:s3:::${StackName}-*"
           - Sid: ManageTheTable
             Effect: Allow
