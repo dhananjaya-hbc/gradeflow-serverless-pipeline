@@ -1,9 +1,7 @@
 """The shared logging and metrics module, and the rules for packaging its library."""
 
-import io
 import json
 import re
-from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -19,29 +17,6 @@ from gradeflow.infrastructure.observability import (
 )
 
 ROOT = Path(__file__).resolve().parents[2]
-
-
-@pytest.fixture
-def log_lines() -> Iterator[io.StringIO]:
-    """Powertools writes to the stream it was created with, so swap it to read what was logged."""
-    handler = logger.registered_handler
-    stream = io.StringIO()
-    previous = handler.setStream(stream)
-    yield stream
-    handler.setStream(previous)
-
-
-def parsed(stream: io.StringIO) -> list[dict]:
-    return [json.loads(line) for line in stream.getvalue().splitlines()]
-
-
-class FakeContext:
-    """The parts of the Lambda context object that Powertools reads."""
-
-    function_name = "ValidateFunction"
-    memory_limit_in_mb = 256
-    invoked_function_arn = "arn:aws:lambda:ap-south-1:111122223333:function:ValidateFunction"
-    aws_request_id = "request-1"
 
 
 # --- metric names ------------------------------------------------------------------------------
@@ -104,50 +79,107 @@ def test_only_names_from_the_list_are_accepted() -> None:
 # --- logging -----------------------------------------------------------------------------------
 
 
-def test_a_log_line_is_json_with_the_service_and_any_extra_fields(log_lines: io.StringIO) -> None:
+def test_a_log_line_is_json_with_the_service_and_any_extra_fields(logs) -> None:
     logger.info("dataset validated", dataset_id="ds-1", valid_rows=894, total_rows=904)
-    (entry,) = parsed(log_lines)
+    (entry,) = logs.entries
     assert entry["message"] == "dataset validated"
     assert entry["level"] == "INFO"
     assert entry["service"] == "gradeflow"
     assert (entry["dataset_id"], entry["valid_rows"], entry["total_rows"]) == ("ds-1", 894, 904)
 
 
-def test_the_handler_decorator_adds_the_lambda_context(log_lines: io.StringIO) -> None:
+def test_the_handler_decorator_adds_the_lambda_context(logs, lambda_context) -> None:
     @with_logging
     def handler(event: dict, context: object) -> None:
         logger.info("working")
 
-    handler({}, FakeContext())
-    (entry,) = parsed(log_lines)
-    assert entry["function_name"] == "ValidateFunction"
+    handler({}, lambda_context)
+    (entry,) = logs.entries
+    assert entry["function_name"] == "TestFunction"
     assert entry["function_request_id"] == "request-1"
     assert entry["function_memory_size"] == 256
     assert "cold_start" in entry
 
 
-def test_a_dataset_id_does_not_leak_into_the_next_invocation(log_lines: io.StringIO) -> None:
+def test_a_workflow_step_gets_its_dataset_id_on_every_line(logs, lambda_context) -> None:
+    @with_logging
+    def handler(event: dict, context: object) -> None:
+        logger.info("first")
+        logger.warning("second")
+
+    handler({"dataset_id": "ds-7", "bucket": "raw"}, lambda_context)
+    assert [entry["dataset_id"] for entry in logs.entries] == ["ds-7", "ds-7"]
+
+
+def test_a_dataset_id_does_not_leak_into_the_next_invocation(logs, lambda_context) -> None:
     """A warm container serves many datasets; each log line must name only its own."""
 
     @with_logging
     def handler(event: dict, context: object) -> None:
-        if "id" in event:
-            logger.append_keys(dataset_id=event["id"])
         logger.info("working")
 
-    handler({"id": "A"}, FakeContext())
-    handler({}, FakeContext())  # this call never names a dataset
-    first, second = parsed(log_lines)
+    handler({"dataset_id": "A"}, lambda_context)
+    handler({}, lambda_context)  # this call never names a dataset
+    first, second = logs.entries
     assert first["dataset_id"] == "A"
     assert "dataset_id" not in second
 
 
-def test_an_exception_is_logged_with_its_stack_trace(log_lines: io.StringIO) -> None:
+@pytest.mark.parametrize("event", [{"dataset_id": 5}, {"dataset_id": None}, [], "text", None])
+def test_events_without_a_usable_dataset_id_are_still_handled(
+    logs, lambda_context, event: object
+) -> None:
+    @with_logging
+    def handler(event: object, context: object) -> str:
+        logger.info("working")
+        return "done"
+
+    assert handler(event, lambda_context) == "done"
+    (entry,) = logs.entries
+    assert "dataset_id" not in entry
+
+
+def test_a_crash_is_logged_as_json_with_the_dataset_and_still_raised(logs, lambda_context) -> None:
+    """Raised again, so Step Functions and SQS still see the failure and retry."""
+
+    @with_logging
+    def handler(event: dict, context: object) -> None:
+        raise ValueError("bad file")
+
+    with pytest.raises(ValueError, match="bad file"):
+        handler({"dataset_id": "ds-2"}, lambda_context)
+
+    (entry,) = logs.entries
+    assert entry["level"] == "ERROR"
+    assert entry["message"] == "handler failed"
+    assert entry["dataset_id"] == "ds-2"
+    assert entry["function_name"] == "TestFunction"
+    assert "ValueError: bad file" in entry["exception"]
+
+
+def test_the_decorator_returns_what_the_handler_returns(lambda_context) -> None:
+    @with_logging
+    def handler(event: dict, context: object) -> dict:
+        return {"statusCode": 200}
+
+    assert handler({}, lambda_context) == {"statusCode": 200}
+
+
+def test_the_decorator_keeps_the_handlers_name_and_docstring() -> None:
+    @with_logging
+    def my_handler(event: dict, context: object) -> None:
+        """Does the work."""
+
+    assert my_handler.__name__ == "my_handler"
+    assert my_handler.__doc__ == "Does the work."
+
+
+def test_an_exception_is_logged_with_its_stack_trace(logs) -> None:
     try:
         raise ValueError("bad file")
     except ValueError:
         logger.exception("step crashed", dataset_id="ds-2")
-    (entry,) = parsed(log_lines)
+    (entry,) = logs.entries
     assert entry["level"] == "ERROR"
     assert "ValueError: bad file" in entry["exception"]
 
