@@ -3,6 +3,9 @@ import { NavLink, Outlet } from "react-router-dom";
 export function Layout() {
   return (
     <>
+      <a className="skip-link" href="#main">
+        Skip to content
+      </a>
       <header className="site-header">
         <NavLink to="/" className="brand">
           GradeFlow
@@ -14,7 +17,7 @@ export function Layout() {
           <NavLink to="/upload">Upload</NavLink>
         </nav>
       </header>
-      <main>
+      <main id="main" tabIndex={-1}>
         <Outlet />
       </main>
     </>
