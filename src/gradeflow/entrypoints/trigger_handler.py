@@ -7,7 +7,6 @@ the message again, and after the queue's maxReceiveCount it lands in the DLQ.
 """
 
 import json
-import logging
 from collections.abc import Iterator
 from datetime import datetime
 from functools import cache
@@ -17,13 +16,12 @@ from urllib.parse import unquote_plus
 from gradeflow.application.pipeline_steps import TriggerPipeline, TriggerRequest
 from gradeflow.infrastructure.config import load_trigger_config
 from gradeflow.infrastructure.dynamodb_repository import DynamoDbDatasetRepository
+from gradeflow.infrastructure.observability import logger, with_logging
 from gradeflow.infrastructure.s3_storage import S3FileStorage
 from gradeflow.infrastructure.step_functions_starter import StepFunctionsStarter
 
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
 
-
+@with_logging
 def handler(event: dict[str, Any], context: object) -> dict[str, Any]:
     """Lambda entry point."""
     return process_event(event, _build_use_case())
@@ -48,8 +46,10 @@ def process_event(event: dict[str, Any], use_case: TriggerPipeline) -> dict[str,
         if request is None:
             skipped.append(record["s3"]["object"]["key"])
             continue
+        # One upload per call (BatchSize 1): every line, and a crash, names this dataset.
+        logger.append_keys(dataset_id=request.dataset_id)
         status = use_case.execute(request)
-        logger.info("dataset %s: %s", request.dataset_id, status.value)
+        logger.info("upload processed", dataset_id=request.dataset_id, status=status.value)
         triggered.append({"dataset_id": request.dataset_id, "status": status.value})
     return {"triggered": triggered, "skipped": skipped}
 
@@ -71,7 +71,7 @@ def parse_record(record: dict[str, Any]) -> TriggerRequest | None:
     key = unquote_plus(record["s3"]["object"]["key"])  # S3 URL-encodes keys ("a+b.csv")
     dataset_id = dataset_id_from_key(key)
     if dataset_id is None:
-        logger.warning("skipping %s: expected key 'uploads/<dataset_id>/<filename>'", key)
+        logger.warning("upload skipped: expected key 'uploads/<dataset_id>/<filename>'", key=key)
         return None
     return TriggerRequest(
         dataset_id=dataset_id,
