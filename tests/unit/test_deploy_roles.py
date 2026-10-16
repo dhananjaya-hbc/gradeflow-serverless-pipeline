@@ -81,14 +81,110 @@ def test_only_github_actions_of_one_repository_and_one_branch_can_assume_the_dep
     assert statement["Principal"] == {
         "Federated": {"Sub": "arn:aws:iam::${AWS::AccountId}:oidc-provider/" + GITHUB_OIDC_HOST}
     }
-    assert statement["Condition"] == {  # StringEquals only: no pattern matching, no wildcards
-        "StringEquals": {
-            "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
-            "token.actions.githubusercontent.com:sub": {
-                "Sub": "repo:${GitHubRepository}:ref:refs/heads/${GitHubBranch}"
-            },
-        }
+    condition = statement["Condition"]
+    assert list(condition) == [
+        "StringEquals"
+    ]  # StringEquals only: no pattern matching, no wildcards
+    equals = condition["StringEquals"]
+    assert set(equals) == {
+        "token.actions.githubusercontent.com:aud",
+        "token.actions.githubusercontent.com:sub",
     }
+    assert equals["token.actions.githubusercontent.com:aud"] == "sts.amazonaws.com"
+
+
+def evaluate(node: Any, params: dict[str, str]) -> str:
+    """Resolve the few CloudFormation functions the trust policy's subject is built from."""
+    if isinstance(node, str):
+        return node
+    ((function, argument),) = node.items()
+    if function == "Ref":
+        return params[argument]
+    if function == "Split":
+        delimiter, source = argument
+        return evaluate(source, params).split(delimiter)  # type: ignore[return-value]
+    if function == "Select":
+        index, source = argument
+        values = evaluate(source, params) if isinstance(source, dict) else source
+        return values[int(index)]
+    if function == "Sub":
+        template, variables = argument
+        scope = {**params, **{k: evaluate(v, params) for k, v in variables.items()}}
+        return re.sub(r"\$\{(\w+)\}", lambda m: scope[m.group(1)], template)
+    raise ValueError(f"unsupported function {function}")
+
+
+def default_parameters() -> dict[str, str]:
+    return {name: str(p["Default"]) for name, p in PARAMETERS.items() if "Default" in p}
+
+
+def trust_subject(**overrides: str) -> str:
+    (statement,) = DEPLOY_ROLE["AssumeRolePolicyDocument"]["Statement"]
+    sub = statement["Condition"]["StringEquals"]["token.actions.githubusercontent.com:sub"]
+    return evaluate(sub, {**default_parameters(), **overrides})
+
+
+# The subject GitHub put in the token of the first real deploy run, as recorded by CloudTrail. This
+# repository uses GitHub's immutable subject (numeric owner and repository ids after the names);
+# a trust policy written for the plain `repo:owner/repo:...` form refuses it.
+REAL_SUBJECT = (
+    "repo:dhananjaya-hbc@171498451/gradeflow-serverless-pipeline@1387779260:ref:refs/heads/main"
+)
+
+
+def test_the_trust_subject_is_exactly_the_one_github_sent_on_the_first_real_run() -> None:
+    assert trust_subject() == REAL_SUBJECT
+
+
+def test_the_subject_carries_the_numeric_ids_so_a_recreated_or_renamed_repository_is_refused() -> (
+    None
+):
+    subject = trust_subject()
+    assert re.fullmatch(r"repo:[^@/]+@[0-9]+/[^@/]+@[0-9]+:ref:refs/heads/[^*]+", subject)
+    assert "@" in subject  # the plain form, repo:owner/repo, would let a repo of the same name in
+    assert trust_subject(GitHubRepositoryId="42") != subject
+    assert trust_subject(GitHubOwnerId="42") != subject
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        (
+            {"GitHubBranch": "release"},
+            "repo:dhananjaya-hbc@171498451/gradeflow-serverless-pipeline@1387779260:ref:refs/heads/release",
+        ),
+        (
+            {"GitHubRepository": "o/r", "GitHubOwnerId": "1", "GitHubRepositoryId": "2"},
+            "repo:o@1/r@2:ref:refs/heads/main",
+        ),
+    ],
+)
+def test_the_subject_follows_the_parameters(overrides: dict[str, str], expected: str) -> None:
+    assert trust_subject(**overrides) == expected
+
+
+def test_the_default_ids_are_the_ones_github_reports_for_this_repository() -> None:
+    """Asks GitHub when `gh` is installed and signed in; skipped otherwise (needs the network)."""
+    repo = PARAMETERS["GitHubRepository"]["Default"]
+    try:
+        result = subprocess.run(
+            ["gh", "api", f"repos/{repo}", "--jq", r'"\(.owner.id) \(.id)"'],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pytest.skip("gh is not available")
+    if result.returncode != 0:
+        pytest.skip("gh could not reach GitHub")
+    owner_id, repository_id = result.stdout.split()
+    assert PARAMETERS["GitHubOwnerId"]["Default"] == owner_id
+    assert PARAMETERS["GitHubRepositoryId"]["Default"] == repository_id
+
+
+def test_the_subject_never_contains_a_wildcard_or_a_pull_request_or_environment_part() -> None:
+    subject = trust_subject()
+    assert "*" not in subject and "pull_request" not in subject and "environment" not in subject
 
 
 def test_the_template_reuses_the_accounts_github_provider_and_does_not_create_one() -> None:
@@ -115,6 +211,8 @@ def test_the_default_repository_is_the_one_this_checkout_pushes_to() -> None:
             ["dhananjaya-hbc/gradeflow-serverless-pipeline", "a/b"],
             ["*", "owner/*", "*/repo", "owner", "owner/repo/extra", "owner/re*po", ""],
         ),
+        ("GitHubOwnerId", ["171498451", "1"], ["", "abc", "12 3", "-1", "*", "12.5"]),
+        ("GitHubRepositoryId", ["1387779260", "7"], ["", "abc", "12 3", "-1", "*", "12.5"]),
         ("GitHubBranch", ["main", "release/1.0"], ["*", "main*", "refs/*", "ma?n", "", "a b"]),
         ("StackName", ["gradeflow", "my-stack-2"], ["Grade", "-x", "a--b", "a_b", "*", ""]),
         ("ManagedLayersAccountId", ["336392948345"], ["33639294834", "abc", "*", ""]),
