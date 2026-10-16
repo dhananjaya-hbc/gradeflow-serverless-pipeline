@@ -6,19 +6,17 @@ docker/anomalies/Dockerfile. The image's command is the path below.
 Handler path in template.yaml: gradeflow.entrypoints.anomalies_handler.handler
 """
 
-import logging
 from functools import cache
 from typing import Any
 
 from gradeflow.application.anomaly_step import DetectAnomaliesStep
 from gradeflow.application.pipeline_state import PipelineState
 from gradeflow.infrastructure.config import load_anomalies_config
+from gradeflow.infrastructure.observability import logger, with_logging
 from gradeflow.infrastructure.s3_artifacts import S3DatasetArtifacts
 
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
 
-
+@with_logging
 def handler(event: dict[str, Any], context: object) -> dict[str, Any]:
     """Lambda entry point."""
     return process(event, _build_step())
@@ -39,10 +37,10 @@ def process(event: dict[str, Any], step: DetectAnomaliesStep) -> dict[str, Any]:
     state = PipelineState.from_dict(event)
     outcome = step.execute(state)
     logger.info(
-        "anomalies for dataset %s: total=%d by_method=%s ml_skipped=%s",
-        state.dataset_id,
-        outcome.total,
-        outcome.by_method,
-        outcome.ml_skipped,
+        "anomaly detection finished",
+        dataset_id=state.dataset_id,
+        total=outcome.total,
+        by_method=outcome.by_method,
+        ml_skipped=outcome.ml_skipped,
     )
     return outcome.to_dict()
