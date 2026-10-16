@@ -131,7 +131,8 @@ def test_the_dashboard_bucket_blocks_all_public_access_and_is_encrypted() -> Non
 
 
 def test_only_this_distribution_may_read_the_bucket_and_only_to_read() -> None:
-    (statement,) = POLICY["PolicyDocument"]["Statement"]
+    statements = POLICY["PolicyDocument"]["Statement"]
+    (statement,) = [s for s in statements if s["Effect"] == "Allow"]  # the only Allow
     assert POLICY["Bucket"] == {"Ref": "DashboardBucket"}
     assert statement["Effect"] == "Allow"
     assert statement["Principal"] == {"Service": "cloudfront.amazonaws.com"}  # never "*"
