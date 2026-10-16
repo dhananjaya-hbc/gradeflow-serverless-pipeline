@@ -20,7 +20,16 @@ only for this stack) and which only the deploy role can pass on.
 
 Who can log in as the deploy role: **only** a workflow of `dhananjaya-hbc/gradeflow-serverless-pipeline`
 running on the `main` branch. Pull requests, forks, other branches and tags get a different identity and
-are refused. The CI roles are named `ci-gradeflow-*` on purpose: the execution role may manage IAM roles
+are refused.
+
+The identity GitHub sends (the token's `sub`) is matched exactly. This repository uses GitHub's
+**immutable subject**, which includes the numeric owner and repository ids:
+`repo:dhananjaya-hbc@171498451/gradeflow-serverless-pipeline@1387779260:ref:refs/heads/main`. That is stronger
+than the plain `repo:owner/repo:...` form, because a repository that is deleted, renamed or recreated under
+the same name gets new ids and cannot inherit the role. The ids are public (not secrets). For another
+repository, read them with `gh api repos/OWNER/REPO --jq '.owner.id, .id'`, check the format with
+`gh api repos/OWNER/REPO/actions/oidc/customization/sub` (`use_immutable_subject`), and pass them as
+`GitHubOwnerId` and `GitHubRepositoryId`. The CI roles are named `ci-gradeflow-*` on purpose: the execution role may manage IAM roles
 called `gradeflow-*`, so it can never change the CI roles (and is explicitly denied if it tried).
 
 The account's existing GitHub OIDC provider is reused (an account can hold only one). Check it lists
@@ -36,7 +45,8 @@ aws cloudformation deploy --template-file deploy/github-oidc-role.yaml --stack-n
 ```
 
 It creates 2 roles and 4 managed policies. To use another repository or branch, add
-`--parameter-overrides GitHubRepository=owner/repo GitHubBranch=main`.
+`--parameter-overrides GitHubRepository=owner/repo GitHubOwnerId=<id> GitHubRepositoryId=<id> GitHubBranch=main`.
+If you change the roles later, run the same command again: it updates the stack in place.
 
 **2. Give the role ARNs to GitHub as repository _secrets_.** An ARN is not a credential, but it contains
 the AWS account id, and GitHub prints a *variable's* value in the run log (a secret is masked). This
@@ -80,7 +90,11 @@ status checks `Python (lint and tests)`, `Dashboard (types, tests, build)` and `
 - In the run's log, the AWS login step should say it assumed `ci-gradeflow-deploy`. The session is named
   `github-deploy-<run id>`, so CloudTrail shows which run made each call.
 - A missing variable fails the very first step with a message naming it.
-- If a step fails with `AccessDenied`, the message names the action and the role. CloudTrail (Event
+- If the **login** step fails with "Not authorized to perform sts:AssumeRoleWithWebIdentity", the trust policy
+  refused GitHub's token. CloudTrail records the claims that were presented: look up the event
+  `AssumeRoleWithWebIdentity`; its `userIdentity.userName` is the exact `sub` GitHub sent. Compare it with the
+  deploy role's trust policy (this is how the immutable-subject format was found).
+- If a later step fails with `AccessDenied`, the message names the action and the role. CloudTrail (Event
   history, filter by user name `github-deploy-<run id>`) shows every call. Add the missing
   action to the right policy in `deploy/github-oidc-role.yaml` (the tests in `tests/unit/test_deploy_roles.py` keep
   the scope honest), then update the stack with the command from step 1.
