@@ -28,7 +28,13 @@ from gradeflow.application.queries import (
 )
 from gradeflow.infrastructure.config import load_api_config
 from gradeflow.infrastructure.dynamodb_reader import DynamoDbDatasetReader
-from gradeflow.infrastructure.observability import logger, with_logging
+from gradeflow.infrastructure.observability import (
+    MetricName,
+    logger,
+    record_metric,
+    with_logging,
+    with_metrics,
+)
 from gradeflow.infrastructure.s3_upload_signer import S3UploadSigner
 
 MAX_BODY_BYTES = 4096  # the only body we read is {"filename": "..."}
@@ -175,9 +181,13 @@ def _json_body(event: dict[str, Any]) -> dict[str, Any]:
 
 
 @with_logging
+@with_metrics
 def handler(event: dict[str, Any], context: object) -> dict[str, Any]:
     """Lambda entry point."""
-    return _build_api().handle(event)
+    response = _build_api().handle(event)
+    if response["statusCode"] >= 500:  # our fault, not the caller's: this is what an alarm watches
+        record_metric(MetricName.API_SERVER_ERRORS)
+    return response
 
 
 @cache
