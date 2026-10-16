@@ -2,7 +2,6 @@
 
 import base64
 import json
-import logging
 import os
 import subprocess
 import sys
@@ -244,18 +243,21 @@ class BrokenReader(FakeReader):
         raise RuntimeError("password=hunter2 at db-host-17")
 
 
-def test_an_unexpected_error_is_a_500_without_internal_details(caplog) -> None:
+def test_an_unexpected_error_is_a_500_without_internal_details(logs) -> None:
     api = make_api(BrokenReader())[0]
 
-    with caplog.at_level(logging.ERROR):
-        status, body, headers = call(api, "GET", "/datasets")
+    status, body, headers = call(api, "GET", "/datasets")
 
     assert status == 500
     assert body == {
         "error": {"code": "internal_error", "message": "something went wrong on our side"}
     }
     assert "hunter2" not in json.dumps(body)
-    assert "hunter2" in caplog.text  # the details go to the log, where only we can read them
+    (error,) = [entry for entry in logs.entries if entry["level"] == "ERROR"]
+    assert error["message"] == "unexpected error"
+    assert (error["method"], error["resource"]) == ("GET", "/datasets")
+    # the details go to the log, where only we can read them
+    assert "hunter2" in error["exception"]
     assert headers["Access-Control-Allow-Origin"] == "*"  # even errors are readable by the browser
 
 
@@ -287,11 +289,12 @@ def test_a_specific_allowed_origin_is_sent_back_with_vary() -> None:
     assert headers["Vary"] == "Origin"
 
 
-def test_the_api_key_header_is_never_logged(caplog) -> None:
-    with caplog.at_level(logging.INFO):
-        call(make_api()[0], "GET", "/datasets")
-    assert "not-logged" not in caplog.text
-    assert "GET /datasets -> 200" in caplog.text
+def test_the_api_key_header_is_never_logged(logs) -> None:
+    call(make_api()[0], "GET", "/datasets")
+    assert "not-logged" not in logs.text
+    (entry,) = logs.entries
+    assert entry["message"] == "request handled"
+    assert (entry["method"], entry["path"], entry["status"]) == ("GET", "/datasets", 200)
 
 
 # --- wiring ----------------------------------------------------------------------------
@@ -313,7 +316,7 @@ def test_handler_builds_the_api_from_env(monkeypatch: pytest.MonkeyPatch) -> Non
 
 
 def test_the_handler_function_returns_a_response_for_a_bad_route(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, lambda_context
 ) -> None:
     """handler() end to end; an unknown route never reaches DynamoDB."""
     monkeypatch.setenv("AWS_DEFAULT_REGION", "ap-south-1")
@@ -321,7 +324,7 @@ def test_the_handler_function_returns_a_response_for_a_bad_route(
     monkeypatch.setenv("RAW_BUCKET", "raw-bucket")
     api_handler._build_api.cache_clear()
     try:
-        response = api_handler.handler(event("GET", "/nothing"), None)
+        response = api_handler.handler(event("GET", "/nothing"), lambda_context)
         assert response["statusCode"] == 404
     finally:
         api_handler._build_api.cache_clear()
