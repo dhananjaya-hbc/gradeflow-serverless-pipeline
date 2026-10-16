@@ -61,8 +61,9 @@ gh variable set DASHBOARD_DEV_ORIGIN --body http://localhost:5173
 
 `ALERT_EMAIL` receives the alarm and failure emails (AWS sends one confirmation link the first time).
 `API_ALLOWED_ORIGIN` is the website allowed to call the API from a browser: `*` for now, or the dashboard's
-address to tighten it. `DASHBOARD_DEV_ORIGIN` lets `npm run dev` upload straight to S3; use an empty value
-(`--body ""`) to allow only the deployed dashboard.
+address to tighten it. `DASHBOARD_DEV_ORIGIN` lets `npm run dev` upload straight to S3; use `none` to allow only the deployed
+dashboard (GitHub does not accept an empty variable). Leave a variable unset to get its default: no
+email, `*`, and `http://localhost:5173`.
 
 **4. (Recommended) Protect `main`** so nothing reaches it, and so nothing is deployed, without green checks.
 In GitHub: Settings, Rules, Rulesets, new branch ruleset for `main`, then require a pull request and require the
@@ -71,10 +72,14 @@ status checks `Python (lint and tests)`, `Dashboard (types, tests, build)` and `
 ## Check it
 
 - `gh variable list` shows the six variables (the values are visible to you, not to the public).
-- The first push to `main` after this runs the deploy job. In the run's log, the AWS login step should say it
-  assumed `ci-gradeflow-deploy`.
+- The first push to `main` after this runs the deploy job: build, `sam deploy`, publish the dashboard, then
+  a smoke test that loads the page, reads `config.json`, and calls the API like a browser would. A failed
+  smoke test turns the run red. The job's summary names the commit and the dashboard address.
+- In the run's log, the AWS login step should say it assumed `ci-gradeflow-deploy`. The session is named
+  `github-deploy-<run id>`, so CloudTrail shows which run made each call.
+- A missing variable fails the very first step with a message naming it.
 - If a step fails with `AccessDenied`, the message names the action and the role. CloudTrail (Event
-  history, filter by user name `GitHubActions` or by the role session) shows every call. Add the missing
+  history, filter by user name `github-deploy-<run id>`) shows every call. Add the missing
   action to the right policy in `deploy/github-oidc-role.yaml` (the tests in `tests/unit/test_deploy_roles.py` keep
   the scope honest), then update the stack with the command from step 1.
 
