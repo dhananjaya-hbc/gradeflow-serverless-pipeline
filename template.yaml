@@ -2,11 +2,13 @@ AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
 Description: >
   GradeFlow - serverless data pipeline for education analytics.
-  Phase 7: S3 upload -> SQS (+DLQ) -> trigger Lambda (skips duplicates) -> Step Functions
+  Phase 8: S3 upload -> SQS (+DLQ) -> trigger Lambda (skips duplicates) -> Step Functions
   (validate, clean, stats, anomalies, store; failure branch quarantines, records FAILED and
   alerts) -> Parquet in S3 + DynamoDB. The anomalies step runs from a container image.
   An API Gateway REST API (API key required) serves the results and signs upload forms.
   A React dashboard is served privately from S3 through CloudFront (origin access control).
+  Logs are structured JSON, the pipeline publishes custom metrics, and a CloudWatch dashboard and
+  alarms (which notify the alert topic) watch it.
 
 Metadata:
   cfn-lint:
@@ -69,6 +71,13 @@ Parameters:
       Extra website allowed to upload files straight to S3 from a browser, for running the
       dashboard on your own computer (npm run dev). The deployed dashboard is always allowed.
       Set it to an empty value to allow only the deployed dashboard.
+  LogLevel:
+    Type: String
+    Default: INFO
+    AllowedValues: [DEBUG, INFO, WARNING, ERROR]
+    Description: >
+      How much the Lambdas log. INFO is one line per step. Use DEBUG to investigate a problem
+      (redeploy with --parameter-overrides LogLevel=DEBUG), then set it back.
   PandasLayerArn:
     Type: String
     # AWS SDK for pandas 3.17.1 (pandas, numpy, pyarrow), published by AWS for
@@ -96,6 +105,13 @@ Globals:
     Architectures: [arm64] # Graviton: ~20% cheaper than x86 for the same work
     MemorySize: 256
     Timeout: 60
+    Environment:
+      Variables:
+        # Powertools reads these. The code sets the same service and namespace itself
+        # (infrastructure/observability.py); a test keeps the two in step.
+        POWERTOOLS_SERVICE_NAME: gradeflow
+        POWERTOOLS_METRICS_NAMESPACE: GradeFlow
+        POWERTOOLS_LOG_LEVEL: !Ref LogLevel
 
 Resources:
   # --- Storage ---------------------------------------------------------------------
@@ -476,6 +492,8 @@ Resources:
   AnalyticsApi:
     Type: AWS::Serverless::Api
     Properties:
+      # An explicit name, because the dashboard and the alarm find the API's metrics by this name.
+      Name: !Sub "${AWS::StackName}-api"
       StageName: v1 # URLs look like https://<id>.execute-api.<region>.amazonaws.com/v1/datasets
       # The key is required on each ROUTE (see ApiFunction's events), not on the whole API:
       # a browser's CORS preflight (OPTIONS) is sent without custom headers, so requiring the
@@ -665,6 +683,845 @@ Resources:
         # fallback to index.html, and a missing config.json must stay a clear 403, not an HTML
         # page the browser would fail to parse as JSON.
 
+  # --- Monitoring ------------------------------------------------------------------
+  # One dashboard and four alarms (the first 3 dashboards and 10 alarms in an account are free).
+  # Alarms notify the existing alert topic, which emails AlertEmail when it is set.
+  # Alarm names start with the stack name, which the topic policy below relies on.
+
+  PipelineDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "${AWS::StackName}-pipeline"
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "text",
+              "x": 0,
+              "y": 0,
+              "width": 24,
+              "height": 3,
+              "properties": {
+                "markdown": "# GradeFlow pipeline\\nAlarms first, then what the pipeline did, then how its parts are doing. Business counts come from the `GradeFlow` namespace (published by the handlers); everything else is AWS's own metrics. Follow one dataset through the logs with Logs Insights: `filter dataset_id = \"<id>\"`."
+              }
+            },
+            {
+              "type": "alarm",
+              "x": 0,
+              "y": 3,
+              "width": 24,
+              "height": 4,
+              "properties": {
+                "title": "Alarms",
+                "alarms": [
+                  "${LambdaErrorsAlarm.Arn}",
+                  "${LambdaThrottlesAlarm.Arn}",
+                  "${DeadLetterQueueAlarm.Arn}",
+                  "${ApiServerErrorsAlarm.Arn}"
+                ]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 7,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "title": "Datasets",
+                "region": "${AWS::Region}",
+                "view": "timeSeries",
+                "stat": "Sum",
+                "period": 300,
+                "metrics": [
+                  [
+                    "GradeFlow",
+                    "DatasetsCompleted",
+                    "service",
+                    "gradeflow",
+                    {
+                      "label": "Completed"
+                    }
+                  ],
+                  [
+                    "GradeFlow",
+                    "DatasetsFailed",
+                    "service",
+                    "gradeflow",
+                    {
+                      "label": "Failed"
+                    }
+                  ],
+                  [
+                    "GradeFlow",
+                    "DuplicatesSkipped",
+                    "service",
+                    "gradeflow",
+                    {
+                      "label": "Duplicates skipped"
+                    }
+                  ]
+                ]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 8,
+              "y": 7,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "title": "Rows",
+                "region": "${AWS::Region}",
+                "view": "timeSeries",
+                "stat": "Sum",
+                "period": 300,
+                "metrics": [
+                  [
+                    "GradeFlow",
+                    "RowsReceived",
+                    "service",
+                    "gradeflow",
+                    {
+                      "label": "Received"
+                    }
+                  ],
+                  [
+                    "GradeFlow",
+                    "RowsRejected",
+                    "service",
+                    "gradeflow",
+                    {
+                      "label": "Rejected"
+                    }
+                  ]
+                ]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 16,
+              "y": 7,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "title": "Anomalies found",
+                "region": "${AWS::Region}",
+                "view": "timeSeries",
+                "stat": "Sum",
+                "period": 300,
+                "metrics": [
+                  [
+                    "GradeFlow",
+                    "AnomaliesFound",
+                    "service",
+                    "gradeflow",
+                    {
+                      "label": "Found"
+                    }
+                  ]
+                ]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 13,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "title": "Lambda errors",
+                "region": "${AWS::Region}",
+                "view": "timeSeries",
+                "stat": "Sum",
+                "period": 300,
+                "metrics": [
+                  [
+                    "AWS/Lambda",
+                    "Errors",
+                    "FunctionName",
+                    "${TriggerFunction}",
+                    {
+                      "label": "Trigger"
+                    }
+                  ],
+                  [
+                    "AWS/Lambda",
+                    "Errors",
+                    "FunctionName",
+                    "${ValidateFunction}",
+                    {
+                      "label": "Validate"
+                    }
+                  ],
+                  [
+                    "AWS/Lambda",
+                    "Errors",
+                    "FunctionName",
+                    "${CleanFunction}",
+                    {
+                      "label": "Clean"
+                    }
+                  ],
+                  [
+                    "AWS/Lambda",
+                    "Errors",
+                    "FunctionName",
+                    "${StatsFunction}",
+                    {
+                      "label": "Stats"
+                    }
+                  ],
+                  [
+                    "AWS/Lambda",
+                    "Errors",
+                    "FunctionName",
+                    "${AnomaliesFunction}",
+                    {
+                      "label": "Anomalies"
+                    }
+                  ],
+                  [
+                    "AWS/Lambda",
+                    "Errors",
+                    "FunctionName",
+                    "${StoreFunction}",
+                    {
+                      "label": "Store"
+                    }
+                  ],
+                  [
+                    "AWS/Lambda",
+                    "Errors",
+                    "FunctionName",
+                    "${FailFunction}",
+                    {
+                      "label": "Fail"
+                    }
+                  ],
+                  [
+                    "AWS/Lambda",
+                    "Errors",
+                    "FunctionName",
+                    "${ApiFunction}",
+                    {
+                      "label": "API"
+                    }
+                  ]
+                ]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 8,
+              "y": 13,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "title": "Lambda throttles",
+                "region": "${AWS::Region}",
+                "view": "timeSeries",
+                "stat": "Sum",
+                "period": 300,
+                "metrics": [
+                  [
+                    "AWS/Lambda",
+                    "Throttles",
+                    "FunctionName",
+                    "${TriggerFunction}",
+                    {
+                      "label": "Trigger"
+                    }
+                  ],
+                  [
+                    "AWS/Lambda",
+                    "Throttles",
+                    "FunctionName",
+                    "${ValidateFunction}",
+                    {
+                      "label": "Validate"
+                    }
+                  ],
+                  [
+                    "AWS/Lambda",
+                    "Throttles",
+                    "FunctionName",
+                    "${CleanFunction}",
+                    {
+                      "label": "Clean"
+                    }
+                  ],
+                  [
+                    "AWS/Lambda",
+                    "Throttles",
+                    "FunctionName",
+                    "${StatsFunction}",
+                    {
+                      "label": "Stats"
+                    }
+                  ],
+                  [
+                    "AWS/Lambda",
+                    "Throttles",
+                    "FunctionName",
+                    "${AnomaliesFunction}",
+                    {
+                      "label": "Anomalies"
+                    }
+                  ],
+                  [
+                    "AWS/Lambda",
+                    "Throttles",
+                    "FunctionName",
+                    "${StoreFunction}",
+                    {
+                      "label": "Store"
+                    }
+                  ],
+                  [
+                    "AWS/Lambda",
+                    "Throttles",
+                    "FunctionName",
+                    "${FailFunction}",
+                    {
+                      "label": "Fail"
+                    }
+                  ],
+                  [
+                    "AWS/Lambda",
+                    "Throttles",
+                    "FunctionName",
+                    "${ApiFunction}",
+                    {
+                      "label": "API"
+                    }
+                  ]
+                ]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 16,
+              "y": 13,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "title": "Lambda duration (p95, ms)",
+                "region": "${AWS::Region}",
+                "view": "timeSeries",
+                "stat": "p95",
+                "period": 300,
+                "metrics": [
+                  [
+                    "AWS/Lambda",
+                    "Duration",
+                    "FunctionName",
+                    "${TriggerFunction}",
+                    {
+                      "label": "Trigger"
+                    }
+                  ],
+                  [
+                    "AWS/Lambda",
+                    "Duration",
+                    "FunctionName",
+                    "${ValidateFunction}",
+                    {
+                      "label": "Validate"
+                    }
+                  ],
+                  [
+                    "AWS/Lambda",
+                    "Duration",
+                    "FunctionName",
+                    "${CleanFunction}",
+                    {
+                      "label": "Clean"
+                    }
+                  ],
+                  [
+                    "AWS/Lambda",
+                    "Duration",
+                    "FunctionName",
+                    "${StatsFunction}",
+                    {
+                      "label": "Stats"
+                    }
+                  ],
+                  [
+                    "AWS/Lambda",
+                    "Duration",
+                    "FunctionName",
+                    "${AnomaliesFunction}",
+                    {
+                      "label": "Anomalies"
+                    }
+                  ],
+                  [
+                    "AWS/Lambda",
+                    "Duration",
+                    "FunctionName",
+                    "${StoreFunction}",
+                    {
+                      "label": "Store"
+                    }
+                  ],
+                  [
+                    "AWS/Lambda",
+                    "Duration",
+                    "FunctionName",
+                    "${FailFunction}",
+                    {
+                      "label": "Fail"
+                    }
+                  ],
+                  [
+                    "AWS/Lambda",
+                    "Duration",
+                    "FunctionName",
+                    "${ApiFunction}",
+                    {
+                      "label": "API"
+                    }
+                  ]
+                ]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 19,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "title": "Queues (messages waiting)",
+                "region": "${AWS::Region}",
+                "view": "timeSeries",
+                "stat": "Maximum",
+                "period": 300,
+                "metrics": [
+                  [
+                    "AWS/SQS",
+                    "ApproximateNumberOfMessagesVisible",
+                    "QueueName",
+                    "${UploadQueue.QueueName}",
+                    {
+                      "label": "Upload queue"
+                    }
+                  ],
+                  [
+                    "AWS/SQS",
+                    "ApproximateNumberOfMessagesVisible",
+                    "QueueName",
+                    "${DeadLetterQueue.QueueName}",
+                    {
+                      "label": "Dead-letter queue"
+                    }
+                  ]
+                ]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 8,
+              "y": 19,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "title": "Step Functions runs",
+                "region": "${AWS::Region}",
+                "view": "timeSeries",
+                "stat": "Sum",
+                "period": 300,
+                "metrics": [
+                  [
+                    "AWS/States",
+                    "ExecutionsStarted",
+                    "StateMachineArn",
+                    "${PipelineStateMachine}",
+                    {
+                      "label": "Started"
+                    }
+                  ],
+                  [
+                    "AWS/States",
+                    "ExecutionsSucceeded",
+                    "StateMachineArn",
+                    "${PipelineStateMachine}",
+                    {
+                      "label": "Succeeded"
+                    }
+                  ],
+                  [
+                    "AWS/States",
+                    "ExecutionsFailed",
+                    "StateMachineArn",
+                    "${PipelineStateMachine}",
+                    {
+                      "label": "Failed"
+                    }
+                  ]
+                ]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 16,
+              "y": 19,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "title": "API requests and errors",
+                "region": "${AWS::Region}",
+                "view": "timeSeries",
+                "stat": "Sum",
+                "period": 300,
+                "metrics": [
+                  [
+                    "AWS/ApiGateway",
+                    "Count",
+                    "ApiName",
+                    "${AWS::StackName}-api",
+                    "Stage",
+                    "v1",
+                    {
+                      "label": "Requests"
+                    }
+                  ],
+                  [
+                    "AWS/ApiGateway",
+                    "4XXError",
+                    "ApiName",
+                    "${AWS::StackName}-api",
+                    "Stage",
+                    "v1",
+                    {
+                      "label": "4XX (caller)"
+                    }
+                  ],
+                  [
+                    "AWS/ApiGateway",
+                    "5XXError",
+                    "ApiName",
+                    "${AWS::StackName}-api",
+                    "Stage",
+                    "v1",
+                    {
+                      "label": "5XX (ours)"
+                    }
+                  ],
+                  [
+                    "GradeFlow",
+                    "ApiServerErrors",
+                    "service",
+                    "gradeflow",
+                    {
+                      "label": "5XX from our code"
+                    }
+                  ],
+                  [
+                    "AWS/ApiGateway",
+                    "Latency",
+                    "ApiName",
+                    "${AWS::StackName}-api",
+                    "Stage",
+                    "v1",
+                    {
+                      "label": "Latency p95 (ms)",
+                      "stat": "p95",
+                      "yAxis": "right"
+                    }
+                  ]
+                ]
+              }
+            }
+          ]
+        }
+
+  LambdaErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-lambda-errors"
+      AlarmDescription: >
+        A pipeline or API Lambda raised an error (after its own retries, a step is retried by
+        Step Functions up to 3 times). Open the dashboard, then search the function's log group
+        for level = "ERROR".
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Threshold: 1
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      TreatMissingData: notBreaching # a Lambda that was not called publishes no data: not a problem
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+      Metrics:
+        - Id: total
+          Expression: SUM(METRICS())
+          Label: Errors in any function
+          ReturnData: true
+        - Id: m1
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Errors
+              Dimensions:
+                - Name: FunctionName
+                  Value: !Ref TriggerFunction
+            Period: 300
+            Stat: Sum
+        - Id: m2
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Errors
+              Dimensions:
+                - Name: FunctionName
+                  Value: !Ref ValidateFunction
+            Period: 300
+            Stat: Sum
+        - Id: m3
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Errors
+              Dimensions:
+                - Name: FunctionName
+                  Value: !Ref CleanFunction
+            Period: 300
+            Stat: Sum
+        - Id: m4
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Errors
+              Dimensions:
+                - Name: FunctionName
+                  Value: !Ref StatsFunction
+            Period: 300
+            Stat: Sum
+        - Id: m5
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Errors
+              Dimensions:
+                - Name: FunctionName
+                  Value: !Ref AnomaliesFunction
+            Period: 300
+            Stat: Sum
+        - Id: m6
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Errors
+              Dimensions:
+                - Name: FunctionName
+                  Value: !Ref StoreFunction
+            Period: 300
+            Stat: Sum
+        - Id: m7
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Errors
+              Dimensions:
+                - Name: FunctionName
+                  Value: !Ref FailFunction
+            Period: 300
+            Stat: Sum
+        - Id: m8
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Errors
+              Dimensions:
+                - Name: FunctionName
+                  Value: !Ref ApiFunction
+            Period: 300
+            Stat: Sum
+
+  LambdaThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-lambda-throttles"
+      AlarmDescription: >
+        Lambda refused to start a function because the account's concurrency limit (10 on a new
+        account) was reached. Raise the Lambda concurrency quota (see the README's Limits).
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Threshold: 1
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+      Metrics:
+        - Id: total
+          Expression: SUM(METRICS())
+          Label: Throttles in any function
+          ReturnData: true
+        - Id: m1
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Throttles
+              Dimensions:
+                - Name: FunctionName
+                  Value: !Ref TriggerFunction
+            Period: 300
+            Stat: Sum
+        - Id: m2
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Throttles
+              Dimensions:
+                - Name: FunctionName
+                  Value: !Ref ValidateFunction
+            Period: 300
+            Stat: Sum
+        - Id: m3
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Throttles
+              Dimensions:
+                - Name: FunctionName
+                  Value: !Ref CleanFunction
+            Period: 300
+            Stat: Sum
+        - Id: m4
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Throttles
+              Dimensions:
+                - Name: FunctionName
+                  Value: !Ref StatsFunction
+            Period: 300
+            Stat: Sum
+        - Id: m5
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Throttles
+              Dimensions:
+                - Name: FunctionName
+                  Value: !Ref AnomaliesFunction
+            Period: 300
+            Stat: Sum
+        - Id: m6
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Throttles
+              Dimensions:
+                - Name: FunctionName
+                  Value: !Ref StoreFunction
+            Period: 300
+            Stat: Sum
+        - Id: m7
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Throttles
+              Dimensions:
+                - Name: FunctionName
+                  Value: !Ref FailFunction
+            Period: 300
+            Stat: Sum
+        - Id: m8
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Throttles
+              Dimensions:
+                - Name: FunctionName
+                  Value: !Ref ApiFunction
+            Period: 300
+            Stat: Sum
+
+  DeadLetterQueueAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-dead-letter-queue"
+      AlarmDescription: >
+        An upload event failed 3 times and was parked in the dead-letter queue (kept 14 days).
+        Receive the message to see what it was, fix the cause, then purge the queue.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt DeadLetterQueue.QueueName
+      Statistic: Maximum
+      Period: 300
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Threshold: 1
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+
+  ApiServerErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-api-server-errors"
+      AlarmDescription: >
+        The API answered 5XX three or more times in 5 minutes. This counts every 5XX including
+        the ones API Gateway makes when Lambda is throttled, which our own code never sees.
+      Namespace: AWS/ApiGateway
+      MetricName: 5XXError
+      Dimensions:
+        - Name: ApiName
+          Value: !Sub "${AWS::StackName}-api"
+        - Name: Stage
+          Value: v1
+      Statistic: Sum
+      Period: 300
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Threshold: 3
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+
+  # Only CloudWatch alarms of this stack, in this account, may publish to the alert topic.
+  # (Step Functions publishes through its own role, so it needs nothing here.)
+  AlertTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref AlertTopic]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowThisStacksAlarmsToPublish
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref AlertTopic
+            Condition:
+              StringEquals:
+                "aws:SourceAccount": !Ref AWS::AccountId
+              ArnLike:
+                "aws:SourceArn": !Sub "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${AWS::StackName}-*"
+
   # Log groups with a retention (the default is "never expire", which slowly costs money).
   TriggerFunctionLogGroup:
     Type: AWS::Logs::LogGroup
@@ -755,3 +1612,6 @@ Outputs:
   DashboardDistributionId:
     Description: CloudFront distribution of the dashboard (the deploy script invalidates its cache)
     Value: !Ref DashboardDistribution
+  PipelineDashboardUrl:
+    Description: The CloudWatch dashboard of the pipeline (open it in the AWS console).
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${PipelineDashboard}"
