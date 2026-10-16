@@ -205,6 +205,64 @@ Resources:
             Status: Enabled
             ExpirationInDays: 30
 
+  # --- Encryption in transit ------------------------------------------------------
+  # Every request to a bucket must use HTTPS. (The dashboard bucket has the same rule inside
+  # its own policy, DashboardBucketPolicy.)
+
+  RawBucketTlsPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref RawBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: RefuseUnencryptedConnections
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !GetAtt RawBucket.Arn
+              - !Sub "${RawBucket.Arn}/*"
+            Condition:
+              Bool:
+                "aws:SecureTransport": "false"
+
+  ProcessedBucketTlsPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ProcessedBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: RefuseUnencryptedConnections
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !GetAtt ProcessedBucket.Arn
+              - !Sub "${ProcessedBucket.Arn}/*"
+            Condition:
+              Bool:
+                "aws:SecureTransport": "false"
+
+  QuarantineBucketTlsPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref QuarantineBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: RefuseUnencryptedConnections
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !GetAtt QuarantineBucket.Arn
+              - !Sub "${QuarantineBucket.Arn}/*"
+            Condition:
+              Bool:
+                "aws:SecureTransport": "false"
+
   PipelineTable:
     Type: AWS::DynamoDB::Table
     Properties:
@@ -294,20 +352,21 @@ Resources:
         FailFunctionArn: !GetAtt FailFunction.Arn
         AlertTopicArn: !Ref AlertTopic
       Policies:
-        - LambdaInvokePolicy:
-            FunctionName: !Ref ValidateFunction
-        - LambdaInvokePolicy:
-            FunctionName: !Ref CleanFunction
-        - LambdaInvokePolicy:
-            FunctionName: !Ref StatsFunction
-        - LambdaInvokePolicy:
-            FunctionName: !Ref AnomaliesFunction
-        - LambdaInvokePolicy:
-            FunctionName: !Ref StoreFunction
-        - LambdaInvokePolicy:
-            FunctionName: !Ref FailFunction
-        - SNSPublishMessagePolicy:
-            TopicName: !GetAtt AlertTopic.TopicName
+        # Exact ARNs: SAM's LambdaInvokePolicy template adds a trailing * (a name prefix) that
+        # nothing here needs, because the workflow invokes each function by its own ARN.
+        - Statement:
+            - Effect: Allow
+              Action: lambda:InvokeFunction
+              Resource:
+                - !GetAtt ValidateFunction.Arn
+                - !GetAtt CleanFunction.Arn
+                - !GetAtt StatsFunction.Arn
+                - !GetAtt AnomaliesFunction.Arn
+                - !GetAtt StoreFunction.Arn
+                - !GetAtt FailFunction.Arn
+            - Effect: Allow
+              Action: sns:Publish # the failure alert
+              Resource: !Ref AlertTopic
 
   # --- Functions: one per step, each with only the permissions its step needs -------
 
@@ -327,8 +386,13 @@ Resources:
           TABLE_NAME: !Ref PipelineTable
           STATE_MACHINE_ARN: !Ref PipelineStateMachine
       Policies:
-        - S3ReadPolicy:
-            BucketName: !Ref RawBucket
+        - Statement:
+            - Effect: Allow
+              Action: s3:GetObject # the uploaded file, to fingerprint it
+              Resource: !Sub "${RawBucket.Arn}/uploads/*"
+            - Effect: Allow
+              Action: s3:ListBucket # so a missing file is a clear "not found", not "access denied"
+              Resource: !GetAtt RawBucket.Arn
         - Statement:
             - Effect: Allow
               Action:
@@ -337,12 +401,25 @@ Resources:
               Resource: !GetAtt PipelineTable.Arn
         - StepFunctionsExecutionPolicy:
             StateMachineName: !GetAtt PipelineStateMachine.Name
-      Events:
-        UploadedFile:
-          Type: SQS
-          Properties:
-            Queue: !GetAtt UploadQueue.Arn
-            BatchSize: 1 # one upload per call, so a failure retries exactly that upload
+        # Reading the queue by hand, because SAM's SQS event attaches AWS's managed
+        # AWSLambdaSQSQueueExecutionRole, which allows receiving from EVERY queue in the account.
+        - Statement:
+            - Effect: Allow
+              Action:
+                - sqs:ReceiveMessage
+                - sqs:DeleteMessage
+                - sqs:GetQueueAttributes
+              Resource: !GetAtt UploadQueue.Arn
+
+  # The queue -> Trigger connection (what SAM's `Events: SQS` would create). The logical ID is
+  # the one SAM generated before (<function><event name>), so CloudFormation updates the existing
+  # mapping in place; a new ID would create a second mapping first, which Lambda refuses.
+  TriggerFunctionUploadedFile:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      FunctionName: !Ref TriggerFunction
+      EventSourceArn: !GetAtt UploadQueue.Arn
+      BatchSize: 1 # one upload per call, so a failure retries exactly that upload
 
   ValidateFunction:
     Type: AWS::Serverless::Function
@@ -363,10 +440,16 @@ Resources:
           PROCESSED_BUCKET: !Ref ProcessedBucket
           MIN_VALID_RATIO: !Ref MinValidRatio
       Policies:
-        - S3ReadPolicy:
-            BucketName: !Ref RawBucket
-        - S3WritePolicy:
-            BucketName: !Ref ProcessedBucket
+        - Statement:
+            - Effect: Allow
+              Action: s3:GetObject # the uploaded file
+              Resource: !Sub "${RawBucket.Arn}/uploads/*"
+            - Effect: Allow
+              Action: s3:ListBucket # so a missing file is a clear "not found", not "access denied"
+              Resource: !GetAtt RawBucket.Arn
+            - Effect: Allow
+              Action: s3:PutObject # the valid rows, for the Clean step
+              Resource: !Sub "${ProcessedBucket.Arn}/work/*"
 
   CleanFunction:
     Type: AWS::Serverless::Function
@@ -383,10 +466,13 @@ Resources:
         Variables:
           PROCESSED_BUCKET: !Ref ProcessedBucket
       Policies:
-        - S3ReadPolicy:
-            BucketName: !Ref ProcessedBucket
-        - S3WritePolicy:
-            BucketName: !Ref ProcessedBucket
+        - Statement:
+            - Effect: Allow
+              Action: s3:GetObject # the valid rows Validate left
+              Resource: !Sub "${ProcessedBucket.Arn}/work/*"
+            - Effect: Allow
+              Action: s3:PutObject # the final Parquet file
+              Resource: !Sub "${ProcessedBucket.Arn}/processed/*"
 
   StatsFunction:
     Type: AWS::Serverless::Function
@@ -404,8 +490,10 @@ Resources:
           PROCESSED_BUCKET: !Ref ProcessedBucket
           PASS_MARK: !Ref PassMark
       Policies:
-        - S3ReadPolicy:
-            BucketName: !Ref ProcessedBucket
+        - Statement:
+            - Effect: Allow
+              Action: s3:GetObject # the cleaned Parquet file; read-only
+              Resource: !Sub "${ProcessedBucket.Arn}/processed/*"
 
   AnomaliesFunction:
     Type: AWS::Serverless::Function
@@ -426,10 +514,13 @@ Resources:
           JUMP_THRESHOLD: !Ref JumpThreshold
           IF_CONTAMINATION: !Ref IfContamination
       Policies:
-        - S3ReadPolicy:
-            BucketName: !Ref ProcessedBucket
-        - S3WritePolicy:
-            BucketName: !Ref ProcessedBucket
+        - Statement:
+            - Effect: Allow
+              Action: s3:GetObject # the cleaned Parquet file
+              Resource: !Sub "${ProcessedBucket.Arn}/processed/*"
+            - Effect: Allow
+              Action: s3:PutObject # the findings, for the Store step
+              Resource: !Sub "${ProcessedBucket.Arn}/work/*"
     Metadata:
       Dockerfile: docker/anomalies/Dockerfile
       DockerContext: . # the repository root, so the Dockerfile can COPY src/gradeflow
@@ -477,10 +568,13 @@ Resources:
           TABLE_NAME: !Ref PipelineTable
           QUARANTINE_BUCKET: !Ref QuarantineBucket
       Policies:
-        - S3ReadPolicy:
-            BucketName: !Ref RawBucket # the copy reads the original
-        - S3WritePolicy:
-            BucketName: !Ref QuarantineBucket
+        - Statement:
+            - Effect: Allow
+              Action: s3:GetObject # the quarantine copy reads the original upload
+              Resource: !Sub "${RawBucket.Arn}/uploads/*"
+            - Effect: Allow
+              Action: s3:PutObject # and writes the copy
+              Resource: !Sub "${QuarantineBucket.Arn}/quarantine/*"
         - Statement:
             - Effect: Allow
               Action:
@@ -609,6 +703,16 @@ Resources:
             Condition:
               StringEquals:
                 "AWS:SourceArn": !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${DashboardDistribution}"
+          - Sid: RefuseUnencryptedConnections
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !GetAtt DashboardBucket.Arn
+              - !Sub "${DashboardBucket.Arn}/*"
+            Condition:
+              Bool:
+                "aws:SecureTransport": "false"
 
   DashboardHeaders:
     Type: AWS::CloudFront::ResponseHeadersPolicy
