@@ -1,0 +1,42 @@
+{
+  "dataset_id": "demo-030",
+  "filename": "sample_anoms.csv",
+  "uploaded_at": "2026-10-15T10:09:30.665000+00:00",
+  "status": "COMPLETED",
+  "total_rows": 904,
+  "valid_rows": 894,
+  "clean_rows": 891,
+  "anomaly_count": 9,
+  "duplicate_of": null,
+  "error_message": null,
+  "validation": {
+    "total_rows": 904,
+    "valid_rows": 894,
+    "invalid_rows": 10,
+    "row_errors": [
+      "row 46: student_id 'S123' must be 'S' + 5 digits",
+      "row 119: missing term",
+      "row 377: missing student_name",
+      "row 490: score '-5' must be a number 0-100",
+      "row 542: score '120.5' must be a number 0-100",
+      "row 609: missing score",
+      "row 628: score '150' must be a number 0-100",
+      "row 708: student_id 'X00007' must be 'S' + 5 digits",
+      "row 812: missing subject",
+      "row 845: score '105' must be a number 0-100"
+    ],
+    "error_message": null
+  },
+  "cleaning": {
+    "clean_rows": 891,
+    "duplicates_removed": 3,
+    "processed_key": "processed/demo-030/data.parquet"
+  },
+  "anomalies": {
+    "count": 9,
+    "stored": 9,
+    "ml_skipped": null
+  },
+  "quarantine_key": null,
+  "file_hash": "784b4c4b1fb3e6e526afc0d4cdd2df667b01de2cf557e03d095ceac95fc430ad"
+}
