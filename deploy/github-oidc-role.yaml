@@ -294,11 +294,19 @@ Resources:
           - Sid: ManageQueueMappings
             Effect: Allow
             Action:
-              - lambda:CreateEventSourceMapping
               - lambda:DeleteEventSourceMapping
               - lambda:GetEventSourceMapping
               - lambda:UpdateEventSourceMapping
             Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:event-source-mapping:*"
+          # Creating a mapping cannot be limited to a resource (the new mapping has no ARN yet), so a
+          # statement naming mapping ARNs never matches it. The function is what can be limited.
+          - Sid: CreateQueueMappingsForTheStacksFunctions
+            Effect: Allow
+            Action: lambda:CreateEventSourceMapping
+            Resource: "*"
+            Condition:
+              ArnLike:
+                "lambda:FunctionArn": !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${StackName}-*"
           - Sid: ReadLambdaAccountSettings
             Effect: Allow
             Action:
@@ -347,6 +355,14 @@ Resources:
             Effect: Allow
             Action: s3:GetObject
             Resource: "arn:aws:s3:::aws-sam-cli-managed-default-samclisourcebucket-*/*"
+          # With a service role, CloudFormation checks this permission on the ROLE, not only on the
+          # caller. The SAM transform is an AWS-owned resource, so it cannot be limited by stack name.
+          # (Found by the first CI deploy: "... is not authorized to perform:
+          # cloudformation:CreateChangeSet on resource: ...:aws:transform/Serverless-2016-10-31".)
+          - Sid: RunTheSamTransform
+            Effect: Allow
+            Action: cloudformation:CreateChangeSet
+            Resource: !Sub "arn:aws:cloudformation:${AWS::Region}:aws:transform/Serverless-2016-10-31"
 
   # Data: buckets, the table, queues, the topic, log groups, alarms and the dashboard.
   ExecutionDataPolicy:
@@ -407,14 +423,21 @@ Resources:
               - sns:SetTopicAttributes
               - sns:GetDataProtectionPolicy
               - sns:Subscribe
-              - sns:Unsubscribe
-              - sns:GetSubscriptionAttributes
-              - sns:SetSubscriptionAttributes
               - sns:ListSubscriptionsByTopic
               - sns:TagResource
               - sns:UntagResource
               - sns:ListTagsForResource
             Resource: !Sub "arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${StackName}-*"
+          # These three act on a subscription and SNS offers no resource-level control for them: listed
+          # under the topic's ARN above they would be granted on paper and never match (found by testing
+          # the live role with IAM's policy simulator). Removing the placeholder email address needs them.
+          - Sid: ManageTheEmailSubscription
+            Effect: Allow
+            Action:
+              - sns:Unsubscribe
+              - sns:GetSubscriptionAttributes
+              - sns:SetSubscriptionAttributes
+            Resource: "*"
           - Sid: ManageTheFunctionLogGroups
             Effect: Allow
             Action:
