@@ -16,6 +16,23 @@ Parameters:
     AllowedPattern: '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'
     ConstraintDescription: owner/repository, with no wildcard.
     Description: The only repository whose workflows may assume the deploy role.
+  GitHubOwnerId:
+    Type: String
+    Default: "171498451"
+    AllowedPattern: '^[0-9]+$'
+    ConstraintDescription: The numeric id of the account that owns the repository.
+    Description: >
+      Numeric id of the GitHub account that owns the repository. GitHub puts it in the token's subject,
+      so a repository that is deleted, renamed or recreated under the same name cannot inherit this role.
+      Find it with: gh api repos/OWNER/REPO --jq .owner.id
+  GitHubRepositoryId:
+    Type: String
+    Default: "1387779260"
+    AllowedPattern: '^[0-9]+$'
+    ConstraintDescription: The numeric id of the repository.
+    Description: >
+      Numeric id of the repository (in the token's subject, like the owner id).
+      Find it with: gh api repos/OWNER/REPO --jq .id
   GitHubBranch:
     Type: String
     Default: main
@@ -58,8 +75,15 @@ Resources:
               StringEquals:
                 "token.actions.githubusercontent.com:aud": sts.amazonaws.com
                 # Exactly one repository and one branch. Pull requests, forks, other branches and
-                # tags have a different subject and are refused.
-                "token.actions.githubusercontent.com:sub": !Sub "repo:${GitHubRepository}:ref:refs/heads/${GitHubBranch}"
+                # tags have a different subject and are refused. This repository uses GitHub's
+                # immutable subject, which carries the numeric owner and repository ids:
+                #   repo:<owner>@<owner id>/<repo>@<repo id>:ref:refs/heads/<branch>
+                "token.actions.githubusercontent.com:sub": !Sub
+                  - "repo:${Owner}@${OwnerId}/${Repo}@${RepoId}:ref:refs/heads/${GitHubBranch}"
+                  - Owner: !Select [0, !Split ["/", !Ref GitHubRepository]]
+                    Repo: !Select [1, !Split ["/", !Ref GitHubRepository]]
+                    OwnerId: !Ref GitHubOwnerId
+                    RepoId: !Ref GitHubRepositoryId
       ManagedPolicyArns:
         - !Ref DeployPolicy
 
