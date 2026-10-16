@@ -2,10 +2,9 @@ import { CartesianGrid, Legend, Line, LineChart, ResponsiveContainer, Tooltip, X
 import type { SubjectTermStats } from "../api/types";
 import { termTrends } from "../lib/charts";
 import { formatNumber } from "../lib/format";
+import { CHART_COLORS } from "../lib/palette";
 import { ChartData } from "./ChartData";
 
-// A colour-blind friendly palette; a subject keeps its colour as long as the subject list is the same.
-const COLORS = ["#2563eb", "#dc2626", "#16a34a", "#9333ea", "#ea580c", "#0891b2", "#ca8a04", "#4b5563"];
 
 export function TermLineChart({ groups }: { groups: SubjectTermStats[] }) {
   const { terms, subjects } = termTrends(groups);
@@ -26,7 +25,7 @@ export function TermLineChart({ groups }: { groups: SubjectTermStats[] }) {
                 key={subject}
                 type="monotone"
                 dataKey={subject}
-                stroke={COLORS[index % COLORS.length]}
+                stroke={CHART_COLORS[index % CHART_COLORS.length]}
                 connectNulls={false}
                 dot
               />
