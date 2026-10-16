@@ -1,0 +1,31 @@
+{
+  "dataset_id": "demo-014",
+  "filename": "broken2.csv",
+  "uploaded_at": "2026-10-14T15:58:13.524000+00:00",
+  "status": "FAILED",
+  "total_rows": 0,
+  "valid_rows": 0,
+  "clean_rows": 0,
+  "anomaly_count": 0,
+  "duplicate_of": null,
+  "error_message": "missing required columns: student_name, class, subject, term, year",
+  "validation": {
+    "total_rows": 0,
+    "valid_rows": 0,
+    "invalid_rows": 0,
+    "row_errors": [],
+    "error_message": "missing required columns: student_name, class, subject, term, year"
+  },
+  "cleaning": {
+    "clean_rows": 0,
+    "duplicates_removed": 0,
+    "processed_key": null
+  },
+  "anomalies": {
+    "count": 0,
+    "stored": 0,
+    "ml_skipped": null
+  },
+  "quarantine_key": "quarantine/demo-014/broken2.csv",
+  "file_hash": "503dbf8d888e7a0b0a22d7c70d659c5e88f165e3acd943cd1c21e8b4282694de"
+}
