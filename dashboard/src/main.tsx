@@ -6,6 +6,7 @@ import { ApiProvider } from "./api/context";
 import { ApiClient } from "./api/client";
 import { ConfigError, loadConfig } from "./config";
 import { ErrorBox } from "./components/ErrorBox";
+import "./styles.css";
 
 const root = createRoot(document.getElementById("root")!);
 
