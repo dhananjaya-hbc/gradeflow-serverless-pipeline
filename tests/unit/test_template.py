@@ -113,11 +113,13 @@ def test_every_asl_placeholder_is_substituted_by_a_real_function_or_the_topic() 
 
 def test_the_state_machine_may_invoke_exactly_the_workflow_functions() -> None:
     policies = RESOURCES["PipelineStateMachine"]["Properties"]["Policies"]
-    invoked = {
-        policy["LambdaInvokePolicy"]["FunctionName"]["Ref"]
+    (statement,) = [
+        s
         for policy in policies
-        if "LambdaInvokePolicy" in policy
-    }
+        for s in policy["Statement"]
+        if s["Action"] == "lambda:InvokeFunction"
+    ]
+    invoked = {arn["GetAtt"].removesuffix(".Arn") for arn in statement["Resource"]}
     assert invoked == set(FUNCTIONS) - {"TriggerFunction", "ApiFunction"}  # those two are not steps
 
 
@@ -144,14 +146,16 @@ def dynamodb_actions(name: str) -> set[str]:
 @pytest.mark.parametrize(
     ("name", "expected"),
     [
-        ("TriggerFunction", {"S3ReadPolicy", "Statement", "StepFunctionsExecutionPolicy"}),
-        ("ValidateFunction", {"S3ReadPolicy", "S3WritePolicy"}),  # no DynamoDB
-        ("CleanFunction", {"S3ReadPolicy", "S3WritePolicy"}),  # no DynamoDB
-        ("StatsFunction", {"S3ReadPolicy"}),  # read-only
-        ("AnomaliesFunction", {"S3ReadPolicy", "S3WritePolicy"}),  # no DynamoDB
-        ("ApiFunction", {"Statement"}),  # read DynamoDB, sign S3 uploads: both custom statements
-        ("StoreFunction", {"Statement"}),  # DynamoDB only, no S3
-        ("FailFunction", {"S3ReadPolicy", "S3WritePolicy", "Statement"}),
+        # Only hand-written statements, plus SAM's exact StartExecution template for the Trigger:
+        # the broad S3ReadPolicy / S3WritePolicy templates are gone (see test_iam_least_privilege).
+        ("TriggerFunction", {"Statement", "StepFunctionsExecutionPolicy"}),
+        ("ValidateFunction", {"Statement"}),
+        ("CleanFunction", {"Statement"}),
+        ("StatsFunction", {"Statement"}),
+        ("AnomaliesFunction", {"Statement"}),
+        ("ApiFunction", {"Statement"}),
+        ("StoreFunction", {"Statement"}),
+        ("FailFunction", {"Statement"}),
     ],
 )
 def test_each_function_gets_only_the_kinds_of_access_its_step_needs(
@@ -186,13 +190,17 @@ def test_dynamodb_actions_are_exactly_the_ones_the_step_uses(name: str, expected
 
 
 def test_only_the_trigger_reads_the_queue() -> None:
-    sqs_functions = {
-        name
-        for name, props in FUNCTIONS.items()
-        if any(event["Type"] == "SQS" for event in props.get("Events", {}).values())
-    }
-    assert sqs_functions == {"TriggerFunction"}
-    assert FUNCTIONS["TriggerFunction"]["Events"]["UploadedFile"]["Properties"]["BatchSize"] == 1
+    """Connected by an explicit mapping (an `Events: SQS` entry would make SAM attach a managed
+    policy for every queue in the account; see test_iam_least_privilege)."""
+    mappings = [
+        resource["Properties"]
+        for resource in RESOURCES.values()
+        if resource["Type"] == "AWS::Lambda::EventSourceMapping"
+    ]
+    assert len(mappings) == 1
+    assert mappings[0]["FunctionName"] == {"Ref": "TriggerFunction"}
+    assert mappings[0]["EventSourceArn"] == {"GetAtt": "UploadQueue.Arn"}
+    assert mappings[0]["BatchSize"] == 1
 
 
 def test_queue_visibility_timeout_is_at_least_six_times_the_trigger_timeout() -> None:
