@@ -1,0 +1,498 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  GradeFlow CI/CD access for GitHub Actions. Deploy this stack ONCE, by hand, with an administrator
+  (it creates IAM roles, so the pipeline cannot create it). It makes two roles and no keys:
+  1. ci-<stack>-deploy: what the GitHub workflow assumes (through OIDC, no stored credentials). It may
+     only run CloudFormation on this one stack, upload the build, push the container image, publish the
+     dashboard, read the API key, and hand the second role to CloudFormation.
+  2. ci-<stack>-cfn-exec: the role CloudFormation uses to create and change the resources. Only
+     CloudFormation can assume it, only for this stack, and only the deploy role can pass it.
+  An existing GitHub OIDC provider in the account is reused (an account can have only one).
+
+Parameters:
+  GitHubRepository:
+    Type: String
+    Default: dhananjaya-hbc/gradeflow-serverless-pipeline
+    AllowedPattern: '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'
+    ConstraintDescription: owner/repository, with no wildcard.
+    Description: The only repository whose workflows may assume the deploy role.
+  GitHubBranch:
+    Type: String
+    Default: main
+    AllowedPattern: '^[A-Za-z0-9._/-]+$'
+    ConstraintDescription: One exact branch name, with no wildcard.
+    Description: The only branch that may deploy.
+  StackName:
+    Type: String
+    Default: gradeflow
+    AllowedPattern: '^[a-z][a-z0-9]*(-[a-z0-9]+)*$'
+    Description: >
+      Name of the application stack that CI deploys. Its resources are named <stack>-..., which is
+      what the permissions below are limited to.
+  ManagedLayersAccountId:
+    Type: String
+    Default: "336392948345"
+    AllowedPattern: '^[0-9]{12}$'
+    Description: >
+      The AWS-owned account that publishes the AWS SDK for pandas Lambda layer (the same in every region).
+
+Resources:
+  # --- 1. The role GitHub Actions assumes ----------------------------------------------------------
+
+  DeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      # The name must NOT start with "<stack>-": the execution role may manage IAM roles called
+      # "<stack>-*", and it must never be able to change the CI roles themselves.
+      RoleName: !Sub "ci-${StackName}-deploy"
+      Description: Assumed by GitHub Actions (OIDC) to deploy the stack from the main branch.
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub "arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com"
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                "token.actions.githubusercontent.com:aud": sts.amazonaws.com
+                # Exactly one repository and one branch. Pull requests, forks, other branches and
+                # tags have a different subject and are refused.
+                "token.actions.githubusercontent.com:sub": !Sub "repo:${GitHubRepository}:ref:refs/heads/${GitHubBranch}"
+      ManagedPolicyArns:
+        - !Ref DeployPolicy
+
+  DeployPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "ci-${StackName}-deploy"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: ChangeThisStackAndSamsCompanionStack
+            Effect: Allow
+            Action:
+              - cloudformation:CreateChangeSet
+              - cloudformation:DescribeChangeSet
+              - cloudformation:ExecuteChangeSet
+              - cloudformation:DeleteChangeSet
+              - cloudformation:DescribeStacks
+              - cloudformation:DescribeStackEvents
+              - cloudformation:DescribeStackResource
+              - cloudformation:DescribeStackResources
+              - cloudformation:GetTemplate
+              - cloudformation:ListStackResources
+            Resource:
+              - !Sub "arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${StackName}/*"
+              - !Sub "arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${StackName}-*-CompanionStack/*"
+          - Sid: SamKeepsAnEcrRepositoryInACompanionStack
+            Effect: Allow
+            Action:
+              - cloudformation:CreateStack
+              - cloudformation:UpdateStack
+            Resource: !Sub "arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${StackName}-*-CompanionStack/*"
+          - Sid: ReadSamsManagedArtifactStack
+            Effect: Allow
+            Action:
+              - cloudformation:DescribeStacks
+              - cloudformation:DescribeStackResources
+              - cloudformation:ListStackResources
+            Resource: !Sub "arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/aws-sam-cli-managed-default/*"
+          - Sid: RunTheSamTransform
+            Effect: Allow
+            Action: cloudformation:CreateChangeSet
+            Resource: !Sub "arn:aws:cloudformation:${AWS::Region}:aws:transform/Serverless-2016-10-31"
+          - Sid: SummariseATemplate
+            Effect: Allow
+            Action: cloudformation:GetTemplateSummary
+            Resource: "*" # the action cannot be limited to a resource
+          - Sid: HandTheExecutionRoleToCloudFormation
+            Effect: Allow
+            Action: iam:PassRole
+            Resource: !GetAtt ExecutionRole.Arn
+            Condition:
+              StringEquals:
+                "iam:PassedToService": cloudformation.amazonaws.com
+          - Sid: UploadTheBuildToSamsArtifactBucket
+            Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+            Resource: "arn:aws:s3:::aws-sam-cli-managed-default-samclisourcebucket-*/*"
+          - Sid: ListSamsArtifactBucket
+            Effect: Allow
+            Action:
+              - s3:ListBucket
+              - s3:GetBucketLocation
+            Resource: "arn:aws:s3:::aws-sam-cli-managed-default-samclisourcebucket-*"
+          - Sid: LogInToEcr
+            Effect: Allow
+            Action: ecr:GetAuthorizationToken
+            Resource: "*" # the action cannot be limited to a resource
+          - Sid: PushTheContainerImage
+            Effect: Allow
+            Action:
+              - ecr:BatchCheckLayerAvailability
+              - ecr:BatchGetImage
+              - ecr:GetDownloadUrlForLayer
+              - ecr:InitiateLayerUpload
+              - ecr:UploadLayerPart
+              - ecr:CompleteLayerUpload
+              - ecr:PutImage
+              - ecr:DescribeImages
+              - ecr:DescribeRepositories
+            Resource: !Sub "arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/${StackName}*"
+          - Sid: PublishTheDashboardFiles
+            Effect: Allow
+            Action:
+              - s3:PutObject
+              - s3:DeleteObject
+            Resource: !Sub "arn:aws:s3:::${StackName}-site-${AWS::AccountId}-${AWS::Region}/*"
+          - Sid: ListTheDashboardBucket
+            Effect: Allow
+            Action: s3:ListBucket
+            Resource: !Sub "arn:aws:s3:::${StackName}-site-${AWS::AccountId}-${AWS::Region}"
+          - Sid: ClearTheDashboardCache
+            Effect: Allow
+            Action: cloudfront:CreateInvalidation
+            Resource: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/*" # ids are random
+          - Sid: ReadTheApiKeyForTheDashboardConfig
+            Effect: Allow
+            Action: apigateway:GET
+            Resource: !Sub "arn:aws:apigateway:${AWS::Region}::/apikeys/*"
+
+  # --- 2. The role CloudFormation uses to build the stack ---------------------------------------------
+
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "ci-${StackName}-cfn-exec"
+      Description: Used by CloudFormation (and only it) to create and change the resources of the stack.
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudformation.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                "aws:SourceAccount": !Ref AWS::AccountId
+              ArnLike:
+                "aws:SourceArn": !Sub "arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${StackName}/*"
+      ManagedPolicyArns:
+        - !Ref ExecutionComputePolicy
+        - !Ref ExecutionDataPolicy
+        - !Ref ExecutionEdgePolicy
+
+  # Compute: roles, functions, the container image, the key Lambda encrypts with, the workflow.
+  ExecutionComputePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "ci-${StackName}-cfn-exec-compute"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: ManageTheStacksIamRoles
+            Effect: Allow
+            Action:
+              - iam:CreateRole
+              - iam:DeleteRole
+              - iam:GetRole
+              - iam:UpdateRole
+              - iam:UpdateAssumeRolePolicy
+              - iam:PutRolePolicy
+              - iam:DeleteRolePolicy
+              - iam:GetRolePolicy
+              - iam:ListRolePolicies
+              - iam:ListAttachedRolePolicies
+              - iam:TagRole
+              - iam:UntagRole
+            Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/${StackName}-*"
+          - Sid: AttachOnlyTheBasicLoggingPolicy
+            Effect: Allow
+            Action:
+              - iam:AttachRolePolicy
+              - iam:DetachRolePolicy
+            Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/${StackName}-*"
+            Condition:
+              ArnEquals:
+                "iam:PolicyARN": arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+          - Sid: PassItsRolesOnlyToLambdaAndStepFunctions
+            Effect: Allow
+            Action: iam:PassRole
+            Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/${StackName}-*"
+            Condition:
+              StringEquals:
+                "iam:PassedToService":
+                  - lambda.amazonaws.com
+                  - states.amazonaws.com
+          - Sid: ReadAccountLimits
+            Effect: Allow
+            Action: iam:GetAccountSummary
+            Resource: "*"
+          - Sid: NeverTouchTheCiRoles
+            Effect: Deny
+            Action:
+              - iam:CreateRole
+              - iam:DeleteRole
+              - iam:UpdateRole
+              - iam:UpdateAssumeRolePolicy
+              - iam:PutRolePolicy
+              - iam:DeleteRolePolicy
+              - iam:AttachRolePolicy
+              - iam:DetachRolePolicy
+              - iam:TagRole
+              - iam:UntagRole
+              - iam:PassRole
+            Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/ci-${StackName}-*"
+          - Sid: ManageTheStacksFunctions
+            Effect: Allow
+            Action:
+              - lambda:CreateFunction
+              - lambda:DeleteFunction
+              - lambda:GetFunction
+              - lambda:GetFunctionConfiguration
+              - lambda:UpdateFunctionCode
+              - lambda:UpdateFunctionConfiguration
+              - lambda:AddPermission
+              - lambda:RemovePermission
+              - lambda:GetPolicy
+              - lambda:ListTags
+              - lambda:TagResource
+              - lambda:UntagResource
+              - lambda:GetFunctionCodeSigningConfig
+              - lambda:GetFunctionRecursionConfig
+              - lambda:GetRuntimeManagementConfig
+            Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${StackName}-*"
+          - Sid: ManageQueueMappings
+            Effect: Allow
+            Action:
+              - lambda:CreateEventSourceMapping
+              - lambda:DeleteEventSourceMapping
+              - lambda:GetEventSourceMapping
+              - lambda:UpdateEventSourceMapping
+            Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:event-source-mapping:*"
+          - Sid: ReadLambdaAccountSettings
+            Effect: Allow
+            Action:
+              - lambda:GetAccountSettings
+              - lambda:ListEventSourceMappings
+            Resource: "*"
+          - Sid: UseThePublishedPandasLayer
+            Effect: Allow
+            Action: lambda:GetLayerVersion
+            Resource: !Sub "arn:aws:lambda:${AWS::Region}:${ManagedLayersAccountId}:layer:*:*"
+          - Sid: LetLambdaPullTheContainerImage
+            Effect: Allow
+            Action:
+              - ecr:BatchGetImage
+              - ecr:GetDownloadUrlForLayer
+              - ecr:GetRepositoryPolicy
+              - ecr:SetRepositoryPolicy
+            Resource: !Sub "arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/${StackName}*"
+          - Sid: LetLambdaEncryptEnvironmentVariablesWithItsDefaultKey
+            Effect: Allow
+            Action:
+              - kms:Decrypt
+              - kms:Encrypt
+              - kms:GenerateDataKey
+              - kms:DescribeKey
+            Resource: !Sub "arn:aws:kms:${AWS::Region}:${AWS::AccountId}:key/*"
+            Condition:
+              StringEquals:
+                "kms:ViaService": !Sub "lambda.${AWS::Region}.amazonaws.com"
+          - Sid: CreateTheWorkflow
+            Effect: Allow
+            Action: states:CreateStateMachine
+            Resource: "*" # the action cannot be limited to a resource
+          - Sid: ManageTheWorkflow
+            Effect: Allow
+            Action:
+              - states:UpdateStateMachine
+              - states:DeleteStateMachine
+              - states:DescribeStateMachine
+              - states:TagResource
+              - states:UntagResource
+              - states:ListTagsForResource
+            # CloudFormation names it after its logical id in the template (PipelineStateMachine).
+            Resource: !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:PipelineStateMachine-*"
+          - Sid: ReadTheBuildArtifacts
+            Effect: Allow
+            Action: s3:GetObject
+            Resource: "arn:aws:s3:::aws-sam-cli-managed-default-samclisourcebucket-*/*"
+
+  # Data: buckets, the table, queues, the topic, log groups, alarms and the dashboard.
+  ExecutionDataPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "ci-${StackName}-cfn-exec-data"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: ManageTheStacksBucketsNotTheirObjects
+            Effect: Allow
+            Action:
+              - s3:CreateBucket
+              - s3:DeleteBucket
+              - s3:DeleteBucketPolicy
+              - s3:ListBucket
+              - s3:GetBucket*
+              - s3:PutBucket*
+              - s3:Get*Configuration
+              - s3:Put*Configuration
+            Resource: !Sub "arn:aws:s3:::${StackName}-*"
+          - Sid: ManageTheTable
+            Effect: Allow
+            Action:
+              - dynamodb:CreateTable
+              - dynamodb:DeleteTable
+              - dynamodb:UpdateTable
+              - dynamodb:DescribeTable
+              - dynamodb:DescribeContinuousBackups
+              - dynamodb:DescribeContributorInsights
+              - dynamodb:DescribeKinesisStreamingDestination
+              - dynamodb:DescribeTimeToLive
+              - dynamodb:GetResourcePolicy
+              - dynamodb:ListTagsOfResource
+              - dynamodb:TagResource
+              - dynamodb:UntagResource
+            Resource:
+              - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${StackName}-*"
+              - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${StackName}-*/index/*"
+          - Sid: ManageTheQueues
+            Effect: Allow
+            Action:
+              - sqs:CreateQueue
+              - sqs:DeleteQueue
+              - sqs:GetQueueAttributes
+              - sqs:GetQueueUrl
+              - sqs:SetQueueAttributes
+              - sqs:TagQueue
+              - sqs:UntagQueue
+              - sqs:ListQueueTags
+            Resource: !Sub "arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:${StackName}-*"
+          - Sid: ManageTheAlertTopic
+            Effect: Allow
+            Action:
+              - sns:CreateTopic
+              - sns:DeleteTopic
+              - sns:GetTopicAttributes
+              - sns:SetTopicAttributes
+              - sns:GetDataProtectionPolicy
+              - sns:Subscribe
+              - sns:Unsubscribe
+              - sns:GetSubscriptionAttributes
+              - sns:SetSubscriptionAttributes
+              - sns:ListSubscriptionsByTopic
+              - sns:TagResource
+              - sns:UntagResource
+              - sns:ListTagsForResource
+            Resource: !Sub "arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${StackName}-*"
+          - Sid: ManageTheFunctionLogGroups
+            Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:DeleteLogGroup
+              - logs:PutRetentionPolicy
+              - logs:DeleteRetentionPolicy
+              - logs:TagResource
+              - logs:UntagResource
+              - logs:ListTagsForResource
+            Resource:
+              - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${StackName}-*"
+              - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${StackName}-*:*"
+          - Sid: ReadLogGroups
+            Effect: Allow
+            Action:
+              - logs:DescribeLogGroups
+              - logs:DescribeIndexPolicies
+              - logs:DescribeResourcePolicies
+            Resource: "*"
+          - Sid: ManageTheAlarms
+            Effect: Allow
+            Action:
+              - cloudwatch:PutMetricAlarm
+              - cloudwatch:DeleteAlarms
+              - cloudwatch:TagResource
+              - cloudwatch:UntagResource
+              - cloudwatch:ListTagsForResource
+            Resource: !Sub "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${StackName}-*"
+          - Sid: ReadAlarms
+            Effect: Allow
+            Action: cloudwatch:DescribeAlarms
+            Resource: "*"
+          - Sid: ManageTheDashboard
+            Effect: Allow
+            Action:
+              - cloudwatch:PutDashboard
+              - cloudwatch:DeleteDashboards
+              - cloudwatch:GetDashboard
+            Resource: !Sub "arn:aws:cloudwatch::${AWS::AccountId}:dashboard/${StackName}-*"
+
+  # Edge: the REST API, and the CloudFront distribution with its access control and headers policy.
+  ExecutionEdgePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "ci-${StackName}-cfn-exec-edge"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: ManageTheRestApiKeyAndUsagePlan
+            Effect: Allow
+            Action:
+              - apigateway:GET
+              - apigateway:POST
+              - apigateway:PUT
+              - apigateway:PATCH
+              - apigateway:DELETE
+            # API Gateway names its resources with random ids, so only the kind can be limited.
+            Resource:
+              - !Sub "arn:aws:apigateway:${AWS::Region}::/restapis"
+              - !Sub "arn:aws:apigateway:${AWS::Region}::/restapis/*"
+              - !Sub "arn:aws:apigateway:${AWS::Region}::/apikeys"
+              - !Sub "arn:aws:apigateway:${AWS::Region}::/apikeys/*"
+              - !Sub "arn:aws:apigateway:${AWS::Region}::/usageplans"
+              - !Sub "arn:aws:apigateway:${AWS::Region}::/usageplans/*"
+              - !Sub "arn:aws:apigateway:${AWS::Region}::/tags/*"
+          - Sid: CreateTheDistributionAndItsParts
+            Effect: Allow
+            Action:
+              - cloudfront:CreateDistribution # also authorises the API call CreateDistributionWithTags
+              - cloudfront:CreateOriginAccessControl
+              - cloudfront:CreateResponseHeadersPolicy
+              - cloudfront:TagResource # the new distribution is created with tags
+            Resource: "*" # creating cannot be limited to a resource
+          - Sid: ChangeTheDistributionAndItsParts
+            Effect: Allow
+            Action:
+              - cloudfront:GetDistribution
+              - cloudfront:GetDistributionConfig
+              - cloudfront:UpdateDistribution
+              - cloudfront:DeleteDistribution
+              - cloudfront:GetOriginAccessControl
+              - cloudfront:GetOriginAccessControlConfig
+              - cloudfront:UpdateOriginAccessControl
+              - cloudfront:DeleteOriginAccessControl
+              - cloudfront:GetResponseHeadersPolicy
+              - cloudfront:GetResponseHeadersPolicyConfig
+              - cloudfront:UpdateResponseHeadersPolicy
+              - cloudfront:DeleteResponseHeadersPolicy
+              - cloudfront:TagResource
+              - cloudfront:UntagResource
+              - cloudfront:ListTagsForResource
+            # CloudFront names these with random ids, so only the kind can be limited.
+            Resource:
+              - !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/*"
+              - !Sub "arn:aws:cloudfront::${AWS::AccountId}:origin-access-control/*"
+              - !Sub "arn:aws:cloudfront::${AWS::AccountId}:response-headers-policy/*"
+
+Outputs:
+  DeployRoleArn:
+    Description: Put this in the GitHub repository variable AWS_DEPLOY_ROLE_ARN.
+    Value: !GetAtt DeployRole.Arn
+  ExecutionRoleArn:
+    Description: Put this in the GitHub repository variable AWS_CFN_ROLE_ARN (sam deploy --role-arn).
+    Value: !GetAtt ExecutionRole.Arn
