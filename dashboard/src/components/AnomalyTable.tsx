@@ -7,6 +7,7 @@ import { filterAnomalies } from "../lib/anomalies";
 import { METHOD_OPTIONS, methodLabel, patternInfo } from "../lib/labels";
 import { ErrorBox } from "./ErrorBox";
 import { Loading } from "./Loading";
+import { TableScroll } from "./TableScroll";
 
 /** The findings, with a method filter (asked of the server) and a student search (on what is loaded). */
 export function AnomalyTable({ datasetId, enabled }: { datasetId: string; enabled: boolean }) {
@@ -57,6 +58,7 @@ export function AnomalyTable({ datasetId, enabled }: { datasetId: string; enable
               {list.hasMore && " Load more to search further."}
             </p>
           ) : (
+            <TableScroll label="Anomalies">
             <table>
               <thead>
                 <tr>
@@ -88,6 +90,7 @@ export function AnomalyTable({ datasetId, enabled }: { datasetId: string; enable
                 })}
               </tbody>
             </table>
+            </TableScroll>
           )}
           <p className="muted">
             Showing {visible.length === list.items.length ? list.items.length : `${visible.length} of ${list.items.length} loaded`}
