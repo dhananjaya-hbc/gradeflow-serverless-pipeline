@@ -97,7 +97,6 @@ def test_every_job_runs_on_a_pinned_runner_image(job: str) -> None:
 def test_no_secret_and_no_long_lived_aws_key_is_used_anywhere() -> None:
     """Deploys use OIDC (a short-lived role), never stored keys."""
     for needle in (
-        "secrets.",
         "aws-access-key-id",
         "aws-secret-access-key",
         "AWS_ACCESS_KEY_ID",
@@ -216,7 +215,7 @@ def test_deploys_never_overlap_and_a_running_deploy_is_never_cancelled() -> None
 def test_the_aws_login_uses_oidc_with_the_deploy_role_and_nothing_long_lived() -> None:
     login = deploy_step("aws-actions/configure-aws-credentials")
     assert login["with"] == {
-        "role-to-assume": "${{ vars.AWS_DEPLOY_ROLE_ARN }}",
+        "role-to-assume": "${{ secrets.AWS_DEPLOY_ROLE_ARN }}",
         "aws-region": "${{ vars.AWS_REGION }}",
         "role-session-name": "github-deploy-${{ github.run_id }}",
         "mask-aws-account-id": True,
@@ -276,30 +275,63 @@ def test_no_step_may_fail_and_let_the_job_carry_on() -> None:
 def test_only_the_deploy_job_touches_aws_variables_or_credentials() -> None:
     for name in ("python", "dashboard", "template"):
         text = yaml.safe_dump(JOBS[name])
-        assert "vars." not in text and "configure-aws-credentials" not in text, name
+        assert "vars." not in text and "secrets." not in text, name
+        assert "configure-aws-credentials" not in text, name
         assert "id-token" not in text and "AWS_" not in text, name
 
 
-# --- the variables the workflow reads and the guide that tells you to set them -------------------
+# --- the secrets and variables the workflow reads, and the guide that tells you to set them -----
+
+# Secrets are for values that would otherwise be printed in this public repository's run logs:
+# GitHub prints a variable's value (in a step's env: and with: blocks) and masks only secrets.
+# None of these is a credential; they hold the AWS account id or a personal address.
+ALLOWED_SECRETS = {"AWS_DEPLOY_ROLE_ARN", "AWS_CFN_ROLE_ARN", "ALERT_EMAIL"}
+ALLOWED_VARIABLES = {"AWS_REGION", "API_ALLOWED_ORIGIN", "DASHBOARD_DEV_ORIGIN"}
 
 
 def workflow_variables() -> set[str]:
     return set(re.findall(r"vars\.([A-Z][A-Z0-9_]*)", CI_TEXT))
 
 
-def test_every_variable_the_workflow_reads_is_explained_in_the_setup_guide() -> None:
-    documented = set(re.findall(r"gh variable set ([A-Z][A-Z0-9_]*)", SETUP_DOC))
-    assert workflow_variables() == documented, workflow_variables() ^ documented
+def workflow_secrets() -> set[str]:
+    return set(re.findall(r"secrets\.([A-Z][A-Z0-9_]*)", CI_TEXT))
 
 
-def test_the_workflow_reads_only_variables_and_no_stored_secrets() -> None:
-    assert workflow_variables() == {
-        "AWS_DEPLOY_ROLE_ARN",
-        "AWS_CFN_ROLE_ARN",
-        "AWS_REGION",
-        "ALERT_EMAIL",
-        "API_ALLOWED_ORIGIN",
-        "DASHBOARD_DEV_ORIGIN",
+def test_the_workflow_reads_exactly_these_secrets_and_these_variables() -> None:
+    assert workflow_secrets() == ALLOWED_SECRETS
+    assert workflow_variables() == ALLOWED_VARIABLES
+
+
+def test_nothing_that_holds_an_account_id_or_an_address_is_a_variable() -> None:
+    """A variable is printed in the public log. These names carry the account id or an email."""
+    for name in workflow_variables():
+        assert not re.search(r"ARN|EMAIL|ACCOUNT|MAIL", name), f"{name} would be printed in the log"
+
+
+def test_no_secret_is_named_like_a_credential() -> None:
+    """Deploys use OIDC. A secret called a key, token or password would mean stored credentials."""
+    for name in workflow_secrets():
+        assert not re.search(r"KEY|TOKEN|PASSWORD|SECRET|CREDENTIAL", name), name
+
+
+def test_every_secret_and_variable_the_workflow_reads_is_explained_in_the_setup_guide() -> None:
+    documented_secrets = set(re.findall(r"gh secret set ([A-Z][A-Z0-9_]*)", SETUP_DOC))
+    documented_variables = set(re.findall(r"gh variable set ([A-Z][A-Z0-9_]*)", SETUP_DOC))
+    assert workflow_secrets() == documented_secrets, workflow_secrets() ^ documented_secrets
+    assert workflow_variables() == documented_variables, workflow_variables() ^ documented_variables
+
+
+def test_the_guide_explains_why_these_are_secrets() -> None:
+    assert "prints a *variable's* value in the run log" in SETUP_DOC
+    assert "gh secret set AWS_DEPLOY_ROLE_ARN" in SETUP_DOC
+
+
+def test_the_deploy_job_passes_the_secrets_through_env_so_they_are_masked_in_the_log() -> None:
+    env = DEPLOY["env"]
+    assert env["AWS_CFN_ROLE_ARN"] == "${{ secrets.AWS_CFN_ROLE_ARN }}"
+    assert env["ALERT_EMAIL"] == "${{ secrets.ALERT_EMAIL }}"
+    assert deploy_step("Check the deploy variables are set")["env"] == {
+        "DEPLOY_ROLE": "${{ secrets.AWS_DEPLOY_ROLE_ARN }}"
     }
 
 
