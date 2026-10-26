@@ -1,13 +1,13 @@
 # Exact versions, the same as requirements-dev.txt, so the container gives the same answers
 # as the tests. boto3 is already part of the Lambda base image.
-numpy==2.5.3
-pandas==2.3.2
-pyarrow==25.0.1
+numpy==2.5.4
+pandas==3.1.0
+pyarrow==26.0.0
 scikit-learn==1.9.1
 scipy==1.18.1
 joblib==1.6.0
 threadpoolctl==3.7.0
 # Logging and metrics, the same versions as the zip Lambdas (src/requirements.txt)
-aws-lambda-powertools==3.36.0
+aws-lambda-powertools==3.37.0
 typing-extensions==4.16.0
 jmespath==1.1.0

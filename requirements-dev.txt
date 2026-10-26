@@ -1,13 +1,13 @@
 # Local development and testing only (not packaged into Lambda).
-pytest==8.4.2
-ruff==0.13.2
-pandas==2.3.2
+pytest==9.1.1
+ruff==0.17.2
+pandas==3.1.0
 scikit-learn==1.9.1  # Isolation Forest; the container Lambda installs the same version
-pyarrow==25.0.1  # Parquet engine; Lambda gets it from the AWS SDK for pandas layer (3.17.1)
-boto3==1.40.39
+pyarrow==26.0.0  # Parquet engine; Lambda gets it from the AWS SDK for pandas layer (3.17.1)
+boto3==1.43.118
 pyyaml==6.0.3  # tests read template.yaml
-moto[s3,dynamodb,stepfunctions]==5.1.13
-aws-lambda-powertools==3.36.0  # structured logs and metrics; the zip Lambdas get it from src/requirements.txt
-aws-sam-translator==1.113.0  # tests expand template.yaml the way `sam deploy` does, to check IAM
+moto[s3,dynamodb,stepfunctions]==5.2.4
+aws-lambda-powertools==3.37.0  # structured logs and metrics; the zip Lambdas get it from src/requirements.txt
+aws-sam-translator==1.115.0  # tests expand template.yaml the way `sam deploy` does, to check IAM
 actionlint-py==1.7.12.25  # tests lint the GitHub Actions workflows (downloads the actionlint binary)
 check-jsonschema==0.38.2  # tests validate the GitHub workflows and dependabot.yml against GitHub's schemas
