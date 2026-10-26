@@ -2,6 +2,6 @@
 # Only what the AWS runtime and layers do not already provide: boto3 is in the runtime, and pandas,
 # numpy and pyarrow come from the AWS SDK for pandas layer, so they must NOT be listed here (a copy
 # here would bloat the zip and shadow the layer). tests/unit/test_observability.py checks this.
-aws-lambda-powertools==3.36.0
+aws-lambda-powertools==3.37.0
 typing-extensions==4.16.0
 jmespath==1.1.0
